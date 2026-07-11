@@ -1,0 +1,167 @@
+---
+- name: Setup dynamic host group if selected
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Add target hosts dynamically from survey input
+      add_host:
+        name: "{{ item }}"
+        groups: dynamic_targets
+      loop: "{{ target_hosts.split(',') }}"
+      when: host_source == 'dynamic'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate PAM credential input if survey is selected
+      fail:
+        msg: "You selected 'survey' for PAM credentials but did not provide both username and password."
+      when: pam_source == 'survey' and (pam_user | length == 0 or pam_pass | length == 0)
+      run_once: true
+
+- name: Deploy SolarWinds Agent
+  hosts: "{{ 'dynamic_targets' if host_source == 'dynamic' else 'all' }}"
+  gather_facts: yes
+  become: yes
+  become_user: root
+
+  vars:
+    ansible_become_method: "{{ become_method }}"
+    ansible_become_password: "{{ pam_pass if pam_source == 'survey' else omit }}"
+    ansible_ssh_user: "{{ pam_user if pam_source == 'survey' else omit }}"
+    ansible_ssh_pass: "{{ pam_pass if pam_source == 'survey' else omit }}"
+    orion_package: roles/solarwinds/files/orion.tar.gz
+    install_path: /tmp/orion.tar.gz
+
+    poller_map:
+      LVDC:
+        - { host: P054SLWAPPS03, ip: 10.35.15.53, port: 17778 }
+        - { host: P054SLWAPPS04, ip: 10.35.15.54, port: 17778 }
+        - { host: P054SLWAPPS05, ip: 10.35.15.120, port: 17778 }
+        - { host: P054SLWAPPS06, ip: 10.35.15.56, port: 17778 }
+        - { host: P054SLWAPPS07, ip: 10.35.15.57, port: 17778 }
+        - { host: P054SLWAPPS08, ip: 10.35.15.58, port: 17778 }
+        - { host: P054SLWAPPS09, ip: 10.35.15.59, port: 17778 }
+        - { host: P054SLWAPPS10, ip: 10.35.15.60, port: 17778 }
+      TUDC:
+        - { host: SEA-SWSAM-01, ip: 10.67.212.77, port: 17778 }
+        - { host: SEA-SWSAM-02, ip: 10.67.212.102, port: 17778 }
+      HKDC:
+        - { host: P062SLWAPPS15, ip: 10.163.15.15, port: 17778 }
+        - { host: P062SLWAPPS22, ip: 10.163.15.19, port: 17778 }
+      UKDC:
+        - { host: P064SLWAPPS13, ip: 10.100.15.10, port: 17778 }
+        - { host: P064SLWAPPS14, ip: 10.100.15.14, port: 17778 }
+      DEDC:
+        - { host: P063SLWAPPS20, ip: 10.104.15.14, port: 17778 }
+      MEDC:
+        - { host: AUS-C-ITU-44, ip: 10.153.120.124, port: 17778 }
+      KADC:
+        - { host: P082SLWAPPS19, ip: 10.106.68.19, port: 17778 }
+
+    location_map:
+      DEDC: { loc: germanywestcentral, reg: it-p-dedc-rg }
+      DQS: { loc: eastus, reg: it-p-dqs-rg }
+      HKDC: { loc: eastasia, reg: it-p-hkdc-rg }
+      KADC: { loc: canadacentral, reg: it-p-kadc-rg }
+      LFDC: { loc: switzerlandnorth, reg: it-p-lfdc-rg }
+      LVDC: { loc: westus, reg: it-p-lvdc-rg }
+      MEDC: { loc: australiaeast, reg: it-p-medc-rg }
+      TUDC: { loc: westus2, reg: it-p-sdc-rg }
+      TKDC: { loc: japaneast, reg: it-p-tkdc-rg }
+      UKDC: { loc: uksouth, reg: it-p-ukdc-rg }
+
+    loc: "{{ location_map[dc].loc }}"
+    reg: "{{ location_map[dc].reg }}"
+    pollers: "{{ poller_map[dc] }}"
+
+  roles:
+    - solarwinds
+
+  tasks:
+    - name: Debug connection and escalation variables
+      debug:
+        msg:
+          - "ansible_ssh_user: {{ ansible_ssh_user | default('not set') }}"
+          - "ansible_ssh_pass: {{ ansible_ssh_pass | default('not set') }}"
+          - "ansible_become_method: {{ ansible_become_method }}"
+          - "ansible_become_password: {{ ansible_become_password | default('not set') }}"
+      no_log: true
+
+    - name: Test poller reachability from target host
+      wait_for:
+        host: "{{ item.ip }}"
+        port: "{{ item.port }}"
+        timeout: 3
+      register: poller_check
+      ignore_errors: true
+      loop: "{{ pollers }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+    - name: Summarize poller reachability
+      debug:
+        msg: >-
+          {% for result in poller_check.results %}
+            {% if not result.failed %}
+              ✅ {{ result.item.host }} is reachable.
+            {% else %}
+              🔒 {{ result.item.host }} ({{ result.item.ip }}:{{ result.item.port }}) is unreachable.
+              ➤ Suggest firewall exception: allow TCP port {{ result.item.port }} to {{ result.item.ip }}
+            {% endif %}
+          {% endfor %}
+      when: poller_check is defined
+
+    - name: Set flag if all pollers are unreachable
+      set_fact:
+        skip_agent_install: true
+      when: poller_check.results | selectattr('failed', 'equalto', true) | list | length == poller_check.results | length
+      delegate_to: localhost
+      run_once: true
+
+    - name: Add the DNS Scavenging Cronjob
+      cron:
+        name: "Addns"
+        minute: "0"
+        hour: "0"
+        day: "*"
+        month: "*"
+        weekday: "6"
+        user: "root"
+        job: "/usr/sbin/addns -U -m -i $(hostname -i)"
+        state: "present"
+
+    - name: Ensure /tmp directory exists
+      file:
+        path: /tmp
+        state: directory
+        mode: '0755'
+
+    - name: Copy the SolarWinds Orion installation package
+      copy:
+        src: "{{ orion_package }}"
+        dest: "{{ install_path }}"
+        mode: '0644'
+
+    - name: Unpack the SolarWinds Agent
+      unarchive:
+        src: "{{ install_path }}"
+        dest: /tmp
+        remote_src: yes
+
+    - name: Copy the SolarWinds Agent Installation Files
+      shell: "cp /tmp/remote_files/* /tmp/"
+      args:
+        executable: /bin/bash
+
+    - name: Install and register the SolarWinds Agent on Ubuntu
+      shell: "/bin/bash /tmp/swagent_ubuntu.sh {{ dc }} ubuntu"
+      when:
+        - ansible_os_family == "Debian"
+        - ansible_distribution == "Ubuntu"
+        - not skip_agent_install | default(false)
+
+    - name: Install and register the SolarWinds Agent on RedHat
+      shell: "/bin/bash /tmp/swagent_rhel.sh {{ dc }} rhel"
+      when:
+        - ansible_os_family == "RedHat"
+        - not skip_agent_install | default(false)
