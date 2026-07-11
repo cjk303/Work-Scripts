@@ -1,0 +1,158 @@
+---
+- name: Batch snapshot VMs via vmsnap API (survey-safe, synchronous)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars:
+    # === Endpoint ===
+    vmsnap_api_base: "http://vmsnap.amer.epiqcorp.com"
+    endpoint: "/api/snapshot"
+    # === Token ===
+    vmsnap_api_token: "7ad4a8023db5cae61303c8f41c847fec"
+    # === Defaults ===
+    snapshot_name_safe_pattern: "^[A-Za-z0-9_.:\\-]+$"
+    request_timeout: 120
+
+  pre_tasks:
+    - name: Lock snapshot timestamp
+      ansible.builtin.set_fact:
+        _snap_ts: "{{ lookup('ansible.builtin.pipe', 'date -u +%Y-%m-%dT%H%MZ') }}"
+
+    - name: Normalize VM input to string (AWX-safe)
+      ansible.builtin.set_fact:
+        _vm_raw_string: >-
+          {{
+            vm_list_raw
+            | default('', true)
+            | ternary(
+                (vm_list_raw | join('\n')) if (vm_list_raw is sequence and vm_list_raw is not string) else vm_list_raw,
+                ''
+              )
+          }}
+
+    - name: Split raw input into clean VM list via shell
+      # printf interprets \n, \r etc — handles both real and AWX-escaped newlines.
+      # tr converts all common separators to real newlines first.
+      # awk strips blanks and deduplicates preserving order.
+      ansible.builtin.shell: |
+        printf '%b' "{{ _vm_raw_string }}" \
+          | tr ';,|' '\n' \
+          | tr -s ' \t' '\n' \
+          | awk 'NF && !seen[$0]++ { print tolower($0) }'
+      register: _vm_split
+      changed_when: false
+
+    - name: Set vm_items from shell output
+      ansible.builtin.set_fact:
+        vm_items: "{{ _vm_split.stdout_lines | reject('equalto', '') | list }}"
+
+    - name: Debug parsed VM list
+      ansible.builtin.debug:
+        msg: "PARSED ({{ vm_items | length }}): {{ vm_items | to_json }}"
+
+    - name: Fail if no VMs were parsed
+      ansible.builtin.assert:
+        that:
+          - vm_items | length > 0
+        fail_msg: >
+          No valid VMs parsed.
+          Raw input was: {{ vm_list_raw | default('UNDEFINED') | to_json }}
+
+    - name: Compute and sanitize snapshot base name
+      ansible.builtin.set_fact:
+        final_snapshot_base: >-
+          {{
+            snapshot_name
+            | default('pre_patch_' ~ _snap_ts, true)
+            | trim
+            | regex_replace('[^A-Za-z0-9_.:\-]', '_')
+            | regex_replace('_+', '_')
+            | regex_replace('^_|_$', '')
+          }}
+
+    - name: Compute and sanitize snapshot description
+      ansible.builtin.set_fact:
+        final_snapshot_desc: >-
+          {{
+            snapshot_desc
+            | default('Created via API', true)
+            | trim
+            | regex_replace('[^A-Za-z0-9_.:\- ]', '_')
+            | regex_replace('_+', '_')
+            | regex_replace('^_|_$', '')
+          }}
+
+    - name: Enforce safe snapshot name characters
+      ansible.builtin.assert:
+        that:
+          - final_snapshot_base is match(snapshot_name_safe_pattern)
+        fail_msg: >
+          Snapshot name '{{ final_snapshot_base }}' still contains invalid characters after sanitization.
+
+    - name: Show parsed VM list
+      ansible.builtin.debug:
+        msg: >
+          Parsed {{ vm_items | length }} VM(s): {{ vm_items | join(', ') }}
+          Snapshot base name: {{ final_snapshot_base }}
+          Snapshot description: {{ final_snapshot_desc }}
+
+  tasks:
+    - name: Create snapshot via API
+      ansible.builtin.uri:
+        url: "{{ vmsnap_api_base }}{{ endpoint }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ vmsnap_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          vm: "{{ item }}"
+          snapshot_name: "{{ final_snapshot_base }}_{{ item }}"
+          snapshot_desc: "{{ final_snapshot_desc }}"
+          include_memory: "{{ include_memory | default(false) | bool }}"
+          skip_cache: "{{ skip_cache | default(false) | bool }}"
+          refresh_cache: "{{ refresh_cache | default(false) | bool }}"
+          multithreaded: false
+        validate_certs: false
+        return_content: true
+        status_code: 200
+        timeout: "{{ request_timeout }}"
+      register: snap_call
+      loop: "{{ vm_items }}"
+      loop_control:
+        label: "{{ item }}"
+      retries: 3
+      delay: 10
+      until: snap_call is not failed
+
+    - name: Print per-VM result summary
+      ansible.builtin.debug:
+        msg: >-
+          [{{ 'OK' if item.status == 200 else 'FAILED' }}]
+          {{ item.item }}
+          {% if item.status == 200 %}
+          → snapshot: {{ final_snapshot_base }}_{{ item.item }}
+          {% else %}
+          → HTTP {{ item.status }} — {{ item.json.message | default(item.content | default('no detail')) }}
+          {% endif %}
+      loop: "{{ snap_call.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Build failed VM list
+      ansible.builtin.set_fact:
+        _failed_vms: >-
+          {{
+            snap_call.results
+            | selectattr('status', 'ne', 200)
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Fail if any snapshots failed
+      ansible.builtin.fail:
+        msg: >
+          {{ _failed_vms | length }} snapshot(s) failed: {{ _failed_vms | join(', ') }}
+          Check the per-VM summary above for details.
+      when: _failed_vms | length > 0
