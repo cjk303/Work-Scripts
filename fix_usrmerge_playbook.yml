@@ -1,0 +1,109 @@
+---
+- name: Setup dynamic host group if selected
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Add target hosts dynamically from survey input
+      add_host:
+        name: "{{ item }}"
+        groups: dynamic_targets
+      loop: "{{ target_hosts.split(',') }}"
+      when: host_source == 'dynamic'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate PAM credential input if survey is selected
+      fail:
+        msg: "You selected 'survey' for PAM credentials but did not provide both username and password."
+      when: pam_source == 'survey' and (pam_user | length == 0 or pam_pass | length == 0)
+      run_once: true
+
+- name: Fix usrmerge issue on Ubuntu 24
+  hosts: "{{ 'dynamic_targets' if host_source == 'dynamic' else 'all' }}"
+  gather_facts: yes
+  become: true
+  become_user: root
+
+  vars:
+    ansible_become_method: "{{ become_method }}"
+    ansible_become_password: "{{ pam_pass if pam_source == 'survey' else omit }}"
+    ansible_ssh_user: "{{ pam_user if pam_source == 'survey' else omit }}"
+    ansible_ssh_pass: "{{ pam_pass if pam_source == 'survey' else omit }}"
+    usrmerge_pkg: usrmerge_25ubuntu2_all.deb
+    official_url: "http://archive.ubuntu.com/ubuntu/pool/main/u/usrmerge/{{ usrmerge_pkg }}"
+    internal_url: "https://p054lnxfore01.epiqcorp.com/pulp/content/Epiq/Library/custom/Ubuntu_22_04_LTS/Ubuntu_22_04_-_Full/pool/main/u/usrmerge/{{ usrmerge_pkg }}"
+
+  tasks:
+    - name: Ensure /tmp directory exists
+      file:
+        path: /tmp
+        state: directory
+        mode: '0755'
+
+    - name: Attempt to download usrmerge package from official URL
+      get_url:
+        url: "{{ official_url }}"
+        dest: "/tmp/{{ usrmerge_pkg }}"
+        mode: '0644'
+      register: download_result
+      ignore_errors: true
+
+    - name: Show download result
+      debug:
+        var: download_result.stdout
+
+    - name: Fallback to internal URL if official download fails
+      get_url:
+        url: "{{ internal_url }}"
+        dest: "/tmp/{{ usrmerge_pkg }}"
+        mode: '0644'
+      when: download_result is failed
+      register: fallback_result
+
+    - name: Show fallback download result
+      debug:
+        var: fallback_result.stdout
+      when: fallback_result is defined
+
+    - name: Install usrmerge package with force
+      ansible.builtin.shell: "dpkg --force-all -i /tmp/{{ usrmerge_pkg }}"
+      args:
+        executable: /bin/bash
+      register: install_result
+    - name: Show install output
+      debug:
+        var: install_result.stdout
+
+    - name: Run usrmerge conversion
+      ansible.builtin.shell: "/usr/lib/usrmerge/convert-usrmerge"
+      args:
+        executable: /bin/bash
+      register: convert_result
+
+    - name: Show conversion output
+      debug:
+        var: convert_result.stdout
+
+    - name: Fix broken dependencies
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: yes
+        force_apt_get: yes
+        state: present
+      register: apt_fix
+
+    - name: Show apt fix output
+      debug:
+        var: apt_fix.stdout
+
+    - name: Run apt install --fix-broken
+      ansible.builtin.shell: "apt install --fix-broken -y"
+      args:
+        executable: /bin/bash
+      when: apt_fix is failed
+      register: fix_broken_result
+
+    - name: Show fix-broken output
+      debug:
+        var: fix_broken_result.stdout
+      when: fix_broken_result is defined
