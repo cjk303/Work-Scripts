@@ -1,0 +1,123 @@
+# ---------------- Dynamic Inventory Setup ----------------
+- name: Setup dynamic host group if selected
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Add target hosts dynamically from survey input
+      add_host:
+        name: "{{ item }}"
+        groups: dynamic_targets
+      loop: "{{ (target_hosts | default('')) | split(',') }}"
+      when: (host_source | default('awx')) == 'dynamic'
+      delegate_to: localhost
+      run_once: true
+
+    - name: Validate PAM credentials if survey is selected
+      fail:
+        msg: "You selected 'survey' for PAM credentials but did not provide both username and password."
+      when: (pam_source | default('')) == 'survey' and ((pam_user | default('')) == '' or (pam_pass | default('')) == '')
+      run_once: true
+
+# ---------------- Nessus Agent Deployment ----------------
+- name: Deploy Nessus Agent (shell-based)
+  hosts: "{{ 'dynamic_targets' if (host_source | default('awx')) == 'dynamic' else 'agents' }}"
+  gather_facts: yes
+  become: yes
+  become_user: root
+
+  vars:
+    ansible_become_method: "{{ escalation_method | default('sudo') }}"
+    ansible_become_password: "{{ pam_pass if (pam_source | default('')) == 'survey' else omit }}"
+    ansible_ssh_user: "{{ pam_user if (pam_source | default('')) == 'survey' else omit }}"
+    ansible_ssh_pass: "{{ pam_pass if (pam_source | default('')) == 'survey' else omit }}"
+    force_relink: "{{ force_relink | default(true) }}"
+    activation_key: "YOUR_HARDCODED_TENABLE_KEY_HERE"
+
+  tasks:
+
+    - name: Fail if no target hosts
+      fail:
+        msg: "No hosts available for deployment."
+      when: (host_source | default('awx')) == 'dynamic' and (groups['dynamic_targets'] | default([])) | length == 0
+      run_once: true
+
+    - name: Debug connection and escalation variables
+      debug:
+        msg:
+          - "ansible_ssh_user: {{ ansible_ssh_user | default('not set') }}"
+          - "ansible_ssh_pass: {{ ansible_ssh_pass | default('not set') }}"
+          - "ansible_become_method: {{ ansible_become_method }}"
+          - "ansible_become_password: {{ ansible_become_password | default('not set') }}"
+      no_log: true
+
+    - name: Skip unsupported OS
+      meta: end_host
+      when: ansible_facts.get('distribution') not in ['RedHat', 'Ubuntu', 'Debian']
+
+    - name: Remove existing Nessus token if force_relink
+      shell: "/opt/nessus_agent/sbin/nessuscli agent unlink"
+      ignore_errors: yes
+      when: force_relink | bool
+
+    # ---------------- RHEL Installation ----------------
+    - name: Copy RHEL package
+      copy:
+        src: "files/el{{ ansible_facts['distribution_major_version'] }}.rpm"
+        dest: "/tmp/el{{ ansible_facts['distribution_major_version'] }}.rpm"
+        mode: "0755"
+      when: ansible_facts.get('os_family') == 'RedHat'
+
+    - name: Install RHEL package (shell)
+      shell: >
+        {{ 'yum -y localinstall' if ansible_facts['distribution_major_version'] == '7' else 'dnf -y localinstall' }}
+        /tmp/el{{ ansible_facts['distribution_major_version'] }}.rpm
+      args:
+        creates: /opt/nessus_agent/sbin/nessuscli
+      register: rhel_result
+      ignore_errors: yes
+      when: ansible_facts.get('os_family') == 'RedHat'
+
+    - name: Set RHEL install status
+      set_fact:
+        install_status: "{{ 'Yes' if (rhel_result.rc | default(1)) == 0 else 'No' }}"
+      when: ansible_facts.get('os_family') == 'RedHat'
+
+    # ---------------- Debian / Ubuntu Installation ----------------
+    - name: Copy Debian/Ubuntu package
+      copy:
+        src: "files/NessusAgent-10.9.0-ubuntu1604_amd64.deb"
+        dest: "/tmp/NessusAgent-10.9.0-ubuntu1604_amd64.deb"
+        mode: "0755"
+      when: ansible_facts.get('distribution') in ['Ubuntu','Debian']
+
+    - name: Install Debian/Ubuntu package (shell)
+      shell: "dpkg -i /tmp/NessusAgent-10.9.0-ubuntu1604_amd64.deb || apt-get install -f -y"
+      args:
+        creates: /opt/nessus_agent/sbin/nessuscli
+      register: deb_result
+      ignore_errors: yes
+      when: ansible_facts.get('distribution') in ['Ubuntu','Debian']
+
+    - name: Set Debian/Ubuntu install status
+      set_fact:
+        install_status: "{{ 'Yes' if (deb_result.rc | default(1)) == 0 else 'No' }}"
+      when: ansible_facts.get('distribution') in ['Ubuntu','Debian']
+
+    # ---------------- Start & Link Nessus Agent ----------------
+    - name: Enable and start Nessus Agent
+      shell: "systemctl enable --now nessusagent"
+      ignore_errors: yes
+
+    - name: Link Nessus Agent (Cloud)
+      shell: "/opt/nessus_agent/sbin/nessuscli agent link --key={{ activation_key }} --cloud"
+      args:
+        creates: /opt/nessus_agent/.nessus/agent.key
+      register: link_result
+      ignore_errors: yes
+
+    - name: Output final deployment status
+      debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          installed: "{{ install_status | default('No') }}"
+          link_status: "{{ 'Success' if (link_result.rc | default(1) == 0) else 'Failed' }}"
