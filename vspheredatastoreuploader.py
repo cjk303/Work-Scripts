@@ -10,28 +10,35 @@ LEFT  pane  — local filesystem (browse + select files to upload)
 RIGHT pane  — vSphere: pick vCenter → pick Datastore → browse folders
 
 Navigation:
-  TAB           Switch active pane
-  ↑ / ↓         Move cursor
-  PgUp / PgDn   Page scroll
-  ENTER         Open directory / enter datastore / enter folder
-  BACKSPACE     Go up one level
-  F5  or U      Upload selected local file to current vSphere path
-  F7  or M      Create new folder (local pane) or new datastore folder (right pane)
-  R             Refresh current pane
-  /             Filter / search in current pane
-  C             Connect to a vCenter (interactive dialog)
-  S             Switch vCenter (if multiple loaded from cred file)
-  Q / F10       Quit
+  TAB            Switch active pane
+  ↑ / ↓          Move cursor
+  PgUp / PgDn    Page scroll
+  Home / End     Jump to first / last entry
+  ENTER          Open directory / enter datastore / enter folder
+  BACKSPACE      Go up one level  (also ← , - , U)
+  F5  or P       Upload selected local file to current vSphere path
+  F7  or M       Create new folder (local pane) or new datastore folder (right pane)
+  R              Refresh current pane (rebuilds the VM folder map)
+  /              Filter / search in current pane
+  ESC            Clear filter
+  C              Connect to a vCenter (interactive dialog)
+  S              Switch vCenter (if multiple loaded from cred file)
+  D              Dump the folder→VM-name map to /tmp for debugging
+  Q / F10        Quit
 
 Usage:
-  # Encrypted cred file (same format as snapshot script):
-  python vsphere_upload_mc.py --cred-file vm_cred.enc --key-file vm_key.key
+  # Encrypted cred file (same format as the snapshot script):
+  python vspheredatastoreuploader.py --cred-file vm_cred.enc --key-file vm_key.key
 
   # Direct credentials:
-  python vsphere_upload_mc.py --host vcenter.local --user admin@vsphere.local --password secret
+  python vspheredatastoreuploader.py --host vcenter.local --user admin@vsphere.local --password secret
 
   # Start local pane in a specific directory:
-  python vsphere_upload_mc.py --host vc --user u --password p --local /data/isos
+  python vspheredatastoreuploader.py --host vc --user u --password p --local /data/isos
+
+  # Large fleet / slow vCenter: skip the expensive layoutEx property.
+  # Resolves fewer folders (VM home folder only) but builds the map much faster.
+  python vspheredatastoreuploader.py --host vc --user u --password p --shallow-map
 """
 
 import ssl
@@ -44,10 +51,10 @@ import threading
 import shutil
 import traceback
 import time
-import urllib.request
+import http.client
 import urllib.parse
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict
 
 # ── optional deps ──────────────────────────────────────────────────────────────
 try:
@@ -76,14 +83,23 @@ C_DIMMED   = 9
 C_PROGRESS = 10
 C_INACTIVE = 11
 
+# Folders that are infrastructure, not VMs — never worth trying to resolve.
+SYSTEM_FOLDERS = {
+    ".vsphere-ha", ".dvsdata", ".sdd.sf", ".naa.presence", ".iormstats.sf",
+    ".vsan.stats", ".snapshot", "lost+found", ".locker",
+}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# SSL / connection helpers  (same pattern as snapshot script)
+# SSL / connection helpers
 # ══════════════════════════════════════════════════════════════════════════════
 def _unverified_ctx():
     return ssl._create_unverified_context()
 
+
 def _verified_ctx():
     return ssl.create_default_context()
+
 
 CERT_ERRORS = (
     "CERTIFICATE_VERIFY_FAILED",
@@ -91,6 +107,7 @@ CERT_ERRORS = (
     "unable to get local issuer certificate",
     "hostname mismatch",
 )
+
 
 def smart_connect(host: str, user: str, password: str):
     """Try verified TLS, fall back to unverified on cert errors."""
@@ -104,8 +121,9 @@ def smart_connect(host: str, user: str, password: str):
             raise
     raise ConnectionError(f"Cannot connect to {host}")
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Credential loader (same encrypted format as snapshot script)
+# Credential loader (same encrypted format as the snapshot script)
 # ══════════════════════════════════════════════════════════════════════════════
 def load_credentials(cred_file: str, key_file: str) -> List[Dict]:
     if not FERNET_OK:
@@ -127,25 +145,66 @@ def load_credentials(cred_file: str, key_file: str) -> List[Dict]:
             vcenters.append({"host": h.strip(), "user": u.strip(), "password": p.strip()})
     return vcenters
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 def _fmt_size(n: int) -> str:
     if n < 0:
         return "?"
+    n = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
             return f"{n:.1f}{unit}"
         n /= 1024
     return f"{n:.1f}PB"
 
+
 def _url_q(s: str) -> str:
     return urllib.parse.quote(s, safe="")
 
+
 def _trunc(s: str, width: int, pad=True) -> str:
+    if width <= 0:
+        return ""
     if len(s) > width:
         s = s[:max(0, width - 1)] + "…"
     return s.ljust(width) if pad else s
+
+
+def _split_ds_path(path: str) -> Optional[Tuple[str, str]]:
+    """
+    Turn a datastore path into (datastore_lower, first_folder_lower).
+
+    Handles both forms that vCenter/ESXi hand back:
+        "[DatastoreName] some-folder/vm.vmx"
+        "/vmfs/volumes/<ds-name-or-uuid>/some-folder/vm.vmx"
+
+    Returns None when the path has no folder component (file sits at the
+    datastore root) or cannot be parsed — callers must not index those,
+    otherwise a root-level "vm.vmx" gets registered as if it were a folder.
+    """
+    path = (path or "").strip()
+    if not path:
+        return None
+
+    if path.startswith("["):
+        ds, sep, rest = path[1:].partition("]")
+        if not sep:
+            return None
+    else:
+        parts = [p for p in path.split("/") if p]
+        # /vmfs/volumes/<ds>/folder/file
+        if len(parts) >= 4 and parts[0] == "vmfs" and parts[1] == "volumes":
+            ds, rest = parts[2], "/".join(parts[3:])
+        else:
+            return None
+
+    segs = [s for s in rest.strip().split("/") if s]
+    if len(segs) < 2:
+        return None                      # no folder — file is at the datastore root
+    return ds.strip().lower(), segs[0].lower()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # vSphere pane data model
@@ -158,20 +217,22 @@ class VSEntry:
     FILE      = "file"
 
     def __init__(self, name: str, kind: str, size: int = 0,
-                 ds_path: str = "", ref=None, extra: str = ""):
+                 ds_path: str = "", ref=None, extra: str = "", raw: str = ""):
         self.name     = name
         self.kind     = kind
         self.size     = size
         self.ds_path  = ds_path   # path inside datastore, e.g. "iso/ubuntu.iso"
         self.ref      = ref       # vim object if relevant
-        self.extra    = extra     # display annotation
+        self.extra    = extra     # display annotation / resolved VM name
+        self.raw      = raw or name   # unmodified name as returned by the browser
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # vSphere pane logic
 # ══════════════════════════════════════════════════════════════════════════════
 class VSpherePane:
 
-    def __init__(self):
+    def __init__(self, deep_map: bool = True):
         self.si          = None
         self.content     = None
         self.connected   = False
@@ -179,9 +240,10 @@ class VSpherePane:
         self.vc_user     = ""
         self.vc_password = ""
         self.tls_label   = ""
+        self.deep_map    = deep_map
 
         self.entries: List[VSEntry] = []
-        self.current_ds: Optional[vim.Datastore] = None
+        self.current_ds = None
         self.current_ds_name: str = ""
         self.current_path: str = ""           # sub-folder inside the datastore
 
@@ -190,7 +252,15 @@ class VSpherePane:
 
         self.status = "Not connected — press C to connect, or pass --host"
         self._lock  = threading.Lock()
+
+        # Folder resolution maps.
+        #   _folder_by_ds   : (datastore_lower, folder_lower) -> VM display name
+        #   _folder_by_name : folder_lower -> VM display name ("" = ambiguous)
+        #   _uuid_to_name   : bios/instance uuid -> VM display name
+        self._folder_by_ds: Dict[Tuple[str, str], str] = {}
+        self._folder_by_name: Dict[str, str] = {}
         self._uuid_to_name: Dict[str, str] = {}
+        self._uuid_map_error: str = "not built"
 
     # ── connect / disconnect ──────────────────────────────────────────────────
     def connect(self, host: str, user: str, password: str) -> bool:
@@ -215,27 +285,58 @@ class VSpherePane:
         self.tls_label   = label
         self.status      = f"Connected ({label} TLS)"
         self._stack      = []
-        self._uuid_to_name: Dict[str, str] = {}   # populated lazily
+
+        self._folder_by_ds   = {}
+        self._folder_by_name = {}
+        self._uuid_to_name   = {}
+
         self._build_uuid_map()
         self._load_datastores()
         return True
 
+    def disconnect(self):
+        if self.si:
+            try:
+                Disconnect(self.si)
+            except Exception:
+                pass
+        self.si = None
+        self.connected = False
+
+    # ── folder → VM name map ──────────────────────────────────────────────────
     def _build_uuid_map(self):
         """
-        Build folder-name -> VM display-name map using PropertyCollector.
+        Build a map from datastore folder names to VM display names.
 
-        Key insight: summary.config.vmPathName is ALWAYS populated (it comes
-        from the datastore inventory, not the guest). It looks like:
-            [DatastoreName] some-folder/vm-name.vmx
-        The folder component is exactly what the datastore browser returns.
+        Why the original single-property approach missed folders:
 
-        We index every possible folder name variant so matching is robust:
-          - The actual folder name from vmPathName  (most reliable)
-          - summary.config.uuid     (BIOS UUID, sometimes used as folder)
-          - summary.config.instanceUuid  (vCenter UUID, used on VMFS6)
+          * It only indexed the folder holding the .vmx.  A VM whose disks,
+            snapshots, swap or logs live in a folder on another datastore had
+            no key for that folder, so it never resolved.  layoutEx.file lists
+            every file the VM owns, on every datastore, which covers all of it.
+
+          * It read summary.config.name / summary.config.vmPathName.  The
+            summary rollup can be null for VMs on disconnected hosts, orphaned
+            VMs, or VMs mid-reconfigure — and the `if not display: continue`
+            then discarded the folder key too.  The top-level `name` property
+            and config.files.vmPathName come straight from inventory and are
+            reliable.
+
+          * Keys were folder-name-only, so two VMs sharing a folder name on
+            different datastores silently overwrote each other.  Keys are now
+            (datastore, folder), with a name-only fallback that refuses to
+            guess when the name is ambiguous.
+
+        Note: folders belonging to VMs registered in a *different* vCenter that
+        shares the same datastore cannot be resolved from here — the container
+        view only sees this vCenter's inventory.
         """
         view = None
-        self._uuid_map_error = ""
+        by_ds: Dict[Tuple[str, str], str] = {}
+        by_name: Dict[str, str] = {}
+        uuid_map: Dict[str, str] = {}
+        deep = self.deep_map
+
         try:
             view = self.content.viewManager.CreateContainerView(
                 self.content.rootFolder, [vim.VirtualMachine], True)
@@ -244,14 +345,22 @@ class VSpherePane:
                 name="tSpec", path="view", skip=False,
                 type=vim.view.ContainerView)
 
+            path_set = [
+                "name",                       # always present, unlike summary.config.name
+                "config.files.vmPathName",
+                "config.files.snapshotDirectory",
+                "config.files.logDirectory",
+                "config.files.suspendDirectory",
+                "summary.config.vmPathName",  # kept as a last-resort fallback
+                "config.uuid",
+                "config.instanceUuid",
+            ]
+            if deep:
+                # Heavy but exhaustive: every file the VM owns, on every datastore.
+                path_set.append("layoutEx.file")
+
             prop_spec = vim.PropertyCollector.PropertySpec(
-                type=vim.VirtualMachine, all=False,
-                pathSet=[
-                    "summary.config.name",           # display name - always present
-                    "summary.config.vmPathName",      # [DS] folder/vm.vmx - always present
-                    "summary.config.uuid",            # BIOS UUID
-                    "summary.config.instanceUuid",    # vCenter UUID (folder name on VMFS6)
-                ])
+                type=vim.VirtualMachine, all=False, pathSet=path_set)
 
             obj_spec = vim.PropertyCollector.ObjectSpec(
                 obj=view, selectSet=[traversal], skip=False)
@@ -266,42 +375,74 @@ class VSpherePane:
                 options=vim.PropertyCollector.RetrieveOptions())
 
             objects = []
-            while True:
-                if result and result.objects:
-                    objects.extend(result.objects)
-                if result and result.token:
-                    result = pc.ContinueRetrievePropertiesEx(token=result.token)
-                else:
+            while result:
+                objects.extend(result.objects or [])
+                if not result.token:
                     break
+                result = pc.ContinueRetrievePropertiesEx(token=result.token)
 
-            uuid_map: Dict[str, str] = {}
+            def _index(path: str, display: str):
+                hit = _split_ds_path(path)
+                if not hit:
+                    return
+                ds, folder = hit
+                if folder in SYSTEM_FOLDERS:
+                    return
+                by_ds.setdefault((ds, folder), display)
+                prev = by_name.get(folder)
+                if prev is None:
+                    by_name[folder] = display
+                elif prev and prev != display:
+                    by_name[folder] = ""      # ambiguous across datastores — don't guess
+
+            skipped = 0
             for o in objects:
-                props   = {dp.name: dp.val for dp in o.propSet}
-                display = (props.get("summary.config.name") or "").strip()
+                props = {dp.name: dp.val for dp in (o.propSet or [])}
+                if not props:
+                    continue                  # the ContainerView object itself
+
+                display = (props.get("name") or "").strip()
                 if not display:
+                    # Fall back to the summary rollup only if the inventory name
+                    # is genuinely absent.
+                    summ = props.get("summary.config")
+                    display = (getattr(summ, "name", "") or "").strip()
+                if not display:
+                    skipped += 1
                     continue
 
-                # Primary key: folder name extracted from vmPathName
-                # "[DS] some-folder/vm.vmx"  ->  "some-folder"
-                vmx = (props.get("summary.config.vmPathName") or "").strip()
-                if vmx:
-                    after_bracket = vmx.split("]", 1)[-1].strip()  # "some-folder/vm.vmx"
-                    folder = after_bracket.split("/")[0].strip()
-                    if folder:
-                        uuid_map[folder.lower()] = display
+                paths = [
+                    props.get("config.files.vmPathName"),
+                    props.get("summary.config.vmPathName"),
+                    props.get("config.files.snapshotDirectory"),
+                    props.get("config.files.logDirectory"),
+                    props.get("config.files.suspendDirectory"),
+                ]
+                for fi in (props.get("layoutEx.file") or []):
+                    paths.append(getattr(fi, "name", ""))
 
-                # Fallback keys: uuid variants
-                for key in ("summary.config.uuid", "summary.config.instanceUuid"):
+                for p in paths:
+                    _index(p, display)
+
+                for key in ("config.uuid", "config.instanceUuid"):
                     val = (props.get(key) or "").strip().lower()
                     if val:
                         uuid_map[val] = display
 
+            self._folder_by_ds   = by_ds
+            self._folder_by_name = by_name
             self._uuid_to_name   = uuid_map
-            self._uuid_map_error = f"OK - {len(uuid_map)} entries"
+            self._uuid_map_error = (
+                f"OK — {len(by_ds)} ds-scoped folders, {len(by_name)} folder names, "
+                f"{len(uuid_map)} uuids, {skipped} VMs skipped (no name), "
+                f"mode={'deep' if deep else 'shallow'}"
+            )
 
         except Exception as exc:
+            self._folder_by_ds   = {}
+            self._folder_by_name = {}
             self._uuid_to_name   = {}
-            self._uuid_map_error = f"uuid map error: {exc}"
+            self._uuid_map_error = f"folder map error: {exc}"
         finally:
             if view:
                 try:
@@ -309,20 +450,25 @@ class VSpherePane:
                 except Exception:
                     pass
 
-    def disconnect(self):
-        if self.si:
-            try:
-                Disconnect(self.si)
-            except Exception:
-                pass
-        self.si = None
-        self.connected = False
+    def resolve_folder(self, ds_name: str, folder: str) -> str:
+        """Return the VM display name for a datastore folder, or ''."""
+        k = (folder or "").strip().lower()
+        if not k or k in SYSTEM_FOLDERS:
+            return ""
+        ds_key = ((ds_name or "").strip().lower(), k)
+        return (self._folder_by_ds.get(ds_key)
+                or self._folder_by_name.get(k)
+                or self._uuid_to_name.get(k)
+                or "")
+
+    def map_size(self) -> int:
+        return len(self._folder_by_ds)
 
     # ── datastore listing ─────────────────────────────────────────────────────
     def _load_datastores(self):
-        self.current_ds   = None
+        self.current_ds      = None
         self.current_ds_name = ""
-        self.current_path = ""
+        self.current_path    = ""
         view = None
         try:
             view = self.content.viewManager.CreateContainerView(
@@ -337,11 +483,12 @@ class VSpherePane:
                     pct  = int(used / cap * 100) if cap else 0
                     extra = f"{_fmt_size(free)} free / {_fmt_size(cap)} total  [{pct}% used]"
                     entries.append(VSEntry(name, VSEntry.DATASTORE, size=cap,
-                                          ref=ds, extra=extra))
+                                           ref=ds, extra=extra, raw=name))
                 except Exception:
                     pass
             entries.sort(key=lambda e: e.name.lower())
             self.entries = entries
+            self.status  = f"{len(entries)} datastores"
         finally:
             if view:
                 try:
@@ -359,7 +506,7 @@ class VSpherePane:
             self._browse("")
         elif entry.kind == VSEntry.DIR:
             self._stack.append((self.current_ds_name, self.current_ds,
-                                 self.current_path, list(self.entries)))
+                                self.current_path, list(self.entries)))
             self.current_path = entry.ds_path
             self._browse(entry.ds_path)
 
@@ -380,7 +527,7 @@ class VSpherePane:
     def refresh(self):
         if not self.connected:
             return
-        self._build_uuid_map()   # pick up any renamed/new VMs
+        self._build_uuid_map()   # pick up renamed / new / relocated VMs
         if self.current_ds is None:
             self._load_datastores()
         else:
@@ -391,9 +538,9 @@ class VSpherePane:
         if not self.current_ds:
             return
         try:
-            browser  = self.current_ds.browser
-            ds_name  = self.current_ds_name
-            ds_path  = f"[{ds_name}]" + (f" {folder_path}" if folder_path else "")
+            browser = self.current_ds.browser
+            ds_name = self.current_ds_name
+            ds_path = f"[{ds_name}]" + (f" {folder_path}" if folder_path else "")
 
             spec = vim.host.DatastoreBrowser.SearchSpec()
             spec.details = vim.host.DatastoreBrowser.FileInfo.Details(
@@ -401,43 +548,64 @@ class VSpherePane:
 
             task = browser.SearchDatastore_Task(datastorePath=ds_path, searchSpec=spec)
 
-            # Wait up to 30 s
-            deadline = time.time() + 30
+            deadline = time.time() + 60
+            timed_out = True
             while time.time() < deadline:
                 state = task.info.state
                 if state in (vim.TaskInfo.State.success, vim.TaskInfo.State.error):
+                    timed_out = False
                     break
                 time.sleep(0.4)
 
+            if timed_out:
+                self.status  = f"Browse timed out after 60s: {ds_path}"
+                self.entries = []
+                return
+
+            if task.info.state == vim.TaskInfo.State.error:
+                err = getattr(task.info.error, "msg", str(task.info.error))
+                self.status  = f"Browse failed: {err}"
+                self.entries = []
+                return
+
             new_entries: List[VSEntry] = []
-            if task.info.state == vim.TaskInfo.State.success:
-                result = task.info.result
-                for fi in (result.file if result else []):
-                    fname = fi.path
-                    if fname in (".", ".."):
-                        continue
-                    is_dir  = isinstance(fi, vim.host.DatastoreBrowser.FolderInfo)
-                    subpath = (folder_path.rstrip("/") + "/" + fname).lstrip("/") \
-                              if folder_path else fname
-                    size    = getattr(fi, "fileSize", 0) or 0
-                    kind    = VSEntry.DIR if is_dir else VSEntry.FILE
+            resolved = 0
+            result = task.info.result
+            for fi in (result.file if result else []):
+                fname = (fi.path or "").strip()
+                if fname in ("", ".", ".."):
+                    continue
 
-                    # Resolve UUID folder names → VM display name.
-                    # Strip whitespace; try the raw name and lower-cased.
-                    fname_clean = fname.strip()
-                    vm_label = (self._uuid_to_name.get(fname_clean) or
-                                self._uuid_to_name.get(fname_clean.lower()) or
-                                "")
+                is_dir  = isinstance(fi, vim.host.DatastoreBrowser.FolderInfo)
+                subpath = (folder_path.rstrip("/") + "/" + fname).lstrip("/") \
+                          if folder_path else fname
+                size    = getattr(fi, "fileSize", 0) or 0
+                kind    = VSEntry.DIR if is_dir else VSEntry.FILE
+
+                # Only top-level folders are VM home folders worth resolving.
+                vm_label = ""
+                if is_dir and not folder_path:
+                    vm_label = self.resolve_folder(ds_name, fname)
                     if vm_label:
-                        display_name = f"{fname_clean}  \u2192 {vm_label}"
-                    else:
-                        display_name = fname_clean
+                        resolved += 1
 
-                    new_entries.append(VSEntry(display_name, kind, size=size,
-                                               ds_path=subpath, extra=vm_label))
+                display_name = f"{fname}  \u2192 {vm_label}" if vm_label else fname
+
+                new_entries.append(VSEntry(display_name, kind, size=size,
+                                           ds_path=subpath, extra=vm_label,
+                                           raw=fname))
 
             new_entries.sort(key=lambda e: (e.kind != VSEntry.DIR, e.name.lower()))
             self.entries = new_entries
+
+            if not folder_path:
+                dirs = sum(1 for e in new_entries if e.kind == VSEntry.DIR)
+                unresolved = dirs - resolved
+                self.status = (f"{len(new_entries)} items — {resolved}/{dirs} folders "
+                               f"resolved, {unresolved} unresolved (press D to dump)")
+            else:
+                self.status = f"{len(new_entries)} items"
+
         except Exception as exc:
             self.status  = f"Browse error: {exc}"
             self.entries = []
@@ -465,55 +633,41 @@ class VSpherePane:
     # ── upload ────────────────────────────────────────────────────────────────
     def upload_file(self, local_path: str, progress_cb=None) -> Tuple[bool, str]:
         """
-        Upload local_path to the current datastore folder.
-        Uses the vSphere HTTPS /folder/ REST endpoint.
-        Returns (success, message).
+        Upload local_path to the current datastore folder via the vSphere
+        HTTPS /folder/ endpoint.  Returns (success, message).
         """
         if not self.current_ds:
             return False, "No datastore selected — navigate into a datastore first"
         if not os.path.isfile(local_path):
             return False, f"Local file not found: {local_path}"
 
-        fname    = os.path.basename(local_path)
-        ds_name  = self.current_ds_name
-        subpath  = (self.current_path.rstrip("/") + "/" + fname).lstrip("/") \
-                   if self.current_path else fname
-        dc_name  = self._datacenter_name()
+        fname   = os.path.basename(local_path)
+        ds_name = self.current_ds_name
+        subpath = (self.current_path.rstrip("/") + "/" + fname).lstrip("/") \
+                  if self.current_path else fname
+        dc_name = self._datacenter_name()
 
-        url = (f"https://{self.vc_host}/folder/"
-               f"{_url_q(subpath)}"
-               f"?dcPath={_url_q(dc_name)}&dsName={_url_q(ds_name)}")
+        # The /folder/ endpoint wants path segments quoted individually.
+        quoted_path = "/".join(_url_q(seg) for seg in subpath.split("/") if seg)
+        path_with_qs = (f"/folder/{quoted_path}"
+                        f"?dcPath={_url_q(dc_name)}&dsName={_url_q(ds_name)}")
 
         file_size = os.path.getsize(local_path)
-        ctx = _unverified_ctx()
-
+        conn = None
         try:
+            conn = http.client.HTTPSConnection(
+                self.vc_host, 443,
+                context=_unverified_ctx(), timeout=3600)
+
+            conn.putrequest("PUT", path_with_qs)
+            conn.putheader("Cookie", self.si._stub.cookie)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(file_size))
+            conn.endheaders()
+
+            chunk_size = 256 * 1024
+            sent = 0
             with open(local_path, "rb") as fh:
-                # Build a streaming PUT request
-                req = urllib.request.Request(url, method="PUT")
-                req.add_header("Cookie", self.si._stub.cookie)
-                req.add_header("Content-Type", "application/octet-stream")
-                req.add_header("Content-Length", str(file_size))
-
-                # urllib doesn't stream properly; use http.client directly
-                import http.client, ssl as _ssl
-                parsed = urllib.parse.urlparse(url)
-                conn = http.client.HTTPSConnection(
-                    parsed.hostname, parsed.port or 443,
-                    context=_ssl._create_unverified_context(), timeout=3600)
-
-                qs = parsed.query
-                path_with_qs = parsed.path + ("?" + qs if qs else "")
-
-                conn.putrequest("PUT", path_with_qs)
-                conn.putheader("Cookie", self.si._stub.cookie)
-                conn.putheader("Content-Type", "application/octet-stream")
-                conn.putheader("Content-Length", str(file_size))
-                conn.putheader("Expect", "100-continue")
-                conn.endheaders()
-
-                chunk_size = 256 * 1024   # 256 KB
-                sent = 0
                 while True:
                     chunk = fh.read(chunk_size)
                     if not chunk:
@@ -523,28 +677,33 @@ class VSpherePane:
                     if progress_cb and file_size:
                         progress_cb(sent, file_size)
 
-                resp = conn.getresponse()
-                conn.close()
+            resp = conn.getresponse()
+            status = resp.status
+            body = "" if status in (200, 201) else resp.read(512).decode(errors="replace")
 
-                if resp.status in (200, 201):
-                    self.refresh()
-                    return True, f"Uploaded {fname} → {self.current_ds_path()}/{fname}"
-                else:
-                    body = resp.read(512).decode(errors="replace")
-                    return False, f"HTTP {resp.status}: {body}"
+            if status in (200, 201):
+                self.refresh()
+                return True, f"Uploaded {fname} → {self.current_ds_path()}/{fname}"
+            return False, f"HTTP {status}: {body}"
 
         except Exception as exc:
             return False, f"Upload error: {exc}"
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def mkdir_ds(self, name: str) -> Tuple[bool, str]:
         """Create a folder inside the current datastore path."""
         if not self.current_ds:
             return False, "No datastore selected"
         try:
-            fm       = self.content.fileManager
-            ds_name  = self.current_ds_name
-            sub      = (self.current_path.rstrip("/") + "/" + name).lstrip("/") \
-                       if self.current_path else name
+            fm      = self.content.fileManager
+            ds_name = self.current_ds_name
+            sub     = (self.current_path.rstrip("/") + "/" + name).lstrip("/") \
+                      if self.current_path else name
             new_path = f"[{ds_name}] {sub}"
             fm.MakeDirectory(name=new_path, createParentDirectories=True)
             self.refresh()
@@ -567,20 +726,23 @@ class VSpherePane:
             pass
         return "ha-datacenter"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Local filesystem pane
 # ══════════════════════════════════════════════════════════════════════════════
 class LocalEntry:
     __slots__ = ("name", "is_dir", "size", "path")
+
     def __init__(self, name, is_dir, size, path):
         self.name   = name
         self.is_dir = is_dir
         self.size   = size
         self.path   = path
 
+
 class LocalPane:
     def __init__(self, start: str = "~"):
-        self.cwd    = Path(start).expanduser().resolve()
+        self.cwd = Path(start).expanduser().resolve()
         self.entries: List[LocalEntry] = []
         self.status = ""
         self.refresh()
@@ -589,7 +751,7 @@ class LocalPane:
         entries = []
         try:
             for item in sorted(self.cwd.iterdir(),
-                                key=lambda p: (not p.is_dir(), p.name.lower())):
+                               key=lambda p: (not p.is_dir(), p.name.lower())):
                 try:
                     s = item.stat()
                     is_dir = stat.S_ISDIR(s.st_mode)
@@ -597,7 +759,7 @@ class LocalPane:
                         item.name, is_dir,
                         0 if is_dir else s.st_size,
                         str(item)))
-                except PermissionError:
+                except (PermissionError, OSError):
                     entries.append(LocalEntry(item.name + " [denied]", False, 0, str(item)))
         except PermissionError:
             self.status = "Permission denied"
@@ -635,29 +797,30 @@ class LocalPane:
     def breadcrumb(self) -> str:
         return str(self.cwd)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main TUI
 # ══════════════════════════════════════════════════════════════════════════════
 class MC:
 
     def __init__(self, stdscr, local_start: str, init_vc: Optional[Dict],
-                 all_vcenters: List[Dict]):
-        self.scr         = stdscr
-        self.local       = LocalPane(local_start)
-        self.vs          = VSpherePane()
+                 all_vcenters: List[Dict], deep_map: bool = True):
+        self.scr          = stdscr
+        self.local        = LocalPane(local_start)
+        self.vs           = VSpherePane(deep_map=deep_map)
         self.all_vcenters = all_vcenters   # from cred file, for S=switch
-        self.active      = 0          # 0=left, 1=right
-        self.cursors     = [0, 0]
-        self.offsets     = [0, 0]
-        self.filter      = ["", ""]
-        self.msg         = ""
-        self.msg_err     = False
+        self.active       = 0              # 0=left, 1=right
+        self.cursors      = [0, 0]
+        self.offsets      = [0, 0]
+        self.filter       = ["", ""]
+        self.msg          = ""
+        self.msg_err      = False
 
-        # progress (upload runs in background thread)
-        self._prog_text  = ""
-        self._prog_pct   = -1
-        self._prog_lock  = threading.Lock()
-        self._uploading  = False
+        # progress (upload runs in a background thread)
+        self._prog_text = ""
+        self._prog_pct  = -1
+        self._prog_lock = threading.Lock()
+        self._uploading = False
 
         self._init_colors()
         if init_vc:
@@ -684,16 +847,23 @@ class MC:
 
     # ── background connection ─────────────────────────────────────────────────
     def _bg_connect(self, host, user, password):
-        self.set_msg(f"Connecting to {host} …")
+        self.set_msg(f"Connecting to {host} … (building VM folder map)")
+
         def _do():
             ok = self.vs.connect(host, user, password)
             self.cursors[1] = 0
             self.offsets[1] = 0
             if ok:
-                n = len(self.vs._uuid_to_name)
-                self.set_msg(f"Connected to {host} ({self.vs.tls_label} TLS) — {n} VMs mapped")
+                n = self.vs.map_size()
+                self.set_msg(f"Connected to {host} ({self.vs.tls_label} TLS) — "
+                             f"{n} VM folders mapped")
             else:
                 self.set_msg(self.vs.status, error=True)
+            try:
+                curses.ungetch(0)
+            except Exception:
+                pass
+
         threading.Thread(target=_do, daemon=True).start()
 
     # ── message bar ───────────────────────────────────────────────────────────
@@ -708,7 +878,6 @@ class MC:
         # Fixed rows: 0=title, 1=breadcrumb, 2=colhdr, rows-4=prog_label,
         #             rows-3=prog_bar, rows-2=msg, rows-1=keybar  → 7 fixed rows
         lh = max(1, rows - 7)
-        # content rows: 3 .. 3+lh-1  i.e. up to rows-5  (leaves rows-4..rows-1 free)
         return rows, cols, pw, lh
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -718,17 +887,13 @@ class MC:
         self.scr.erase()
         rows, cols, pw, lh = self._dims()
         if rows < 10 or cols < 20:
+            try:
+                self.scr.addstr(0, 0, "Terminal too small")
+                self.scr.refresh()
+            except curses.error:
+                pass
             return
 
-        # Row layout (fixed positions derived from rows):
-        #   0          title
-        #   1          breadcrumbs
-        #   2          column headers
-        #   3..3+lh-1  file lists   (lh = rows-7)
-        #   rows-4     progress label
-        #   rows-3     progress bar
-        #   rows-2     message / status
-        #   rows-1     key bar
         R_PROG_LBL = rows - 4
         R_PROG_BAR = rows - 3
         R_MSG      = rows - 2
@@ -738,19 +903,19 @@ class MC:
         title = "  vSphere Upload Commander  "
         try:
             self.scr.attron(curses.color_pair(C_HEADER))
-            self.scr.addstr(0, 0, " " * cols)
+            self.scr.addstr(0, 0, " " * (cols - 1))
             self.scr.addstr(0, max(0, (cols - len(title)) // 2), title)
             self.scr.attroff(curses.color_pair(C_HEADER))
         except curses.error:
             pass
 
         # ── breadcrumbs ───────────────────────────────────────────────────────
-        self._draw_bc(1, 0,    pw, self.local.breadcrumb(), self.active == 0)
-        self._draw_bc(1, pw+1, pw, self.vs.breadcrumb(),    self.active == 1)
+        self._draw_bc(1, 0,      pw, self.local.breadcrumb(), self.active == 0)
+        self._draw_bc(1, pw + 1, pw, self.vs.breadcrumb(),    self.active == 1)
 
         # ── column headers ────────────────────────────────────────────────────
-        self._draw_col_header(2, 0,    pw)
-        self._draw_col_header(2, pw+1, pw)
+        self._draw_col_header(2, 0,      pw)
+        self._draw_col_header(2, pw + 1, pw)
 
         # ── vertical divider ──────────────────────────────────────────────────
         for r in range(1, R_PROG_LBL):
@@ -760,38 +925,34 @@ class MC:
                 pass
 
         # ── pane file lists ───────────────────────────────────────────────────
-        self._draw_local(3, 0,    pw, lh)
-        self._draw_vs(   3, pw+1, pw, lh)
+        self._draw_local(3, 0,      pw, lh)
+        self._draw_vs(   3, pw + 1, pw, lh)
 
-        # ── progress rows (always rendered) ───────────────────────────────────
+        # ── progress rows ─────────────────────────────────────────────────────
         with self._prog_lock:
             pt  = self._prog_text
             pct = self._prog_pct
 
         if pt:
-            # Label row
             try:
                 self.scr.attron(curses.color_pair(C_PROGRESS) | curses.A_BOLD)
-                self.scr.addstr(R_PROG_LBL, 0, _trunc(f" \u2191 {pt}", cols))
+                self.scr.addstr(R_PROG_LBL, 0, _trunc(f" \u2191 {pt}", cols - 1))
                 self.scr.attroff(curses.color_pair(C_PROGRESS) | curses.A_BOLD)
             except curses.error:
                 pass
-            # Bar row — filled + empty sections
+
             bar_w  = max(1, cols - 1)
             filled = max(0, min(bar_w, int(bar_w * pct / 100))) if 0 <= pct <= 100 else 0
             empty  = bar_w - filled
             try:
-                # filled portion (reversed = bright)
                 if filled:
                     self.scr.attron(curses.color_pair(C_PROGRESS) | curses.A_REVERSE)
                     self.scr.addstr(R_PROG_BAR, 0, " " * filled)
                     self.scr.attroff(curses.color_pair(C_PROGRESS) | curses.A_REVERSE)
-                # empty portion
                 if empty:
                     self.scr.attron(curses.color_pair(C_DIMMED))
                     self.scr.addstr(R_PROG_BAR, filled, "\u2591" * empty)
                     self.scr.attroff(curses.color_pair(C_DIMMED))
-                # percentage centred
                 pct_str = f" {pct}% "
                 mid = max(0, cols // 2 - len(pct_str) // 2)
                 self.scr.attron(curses.color_pair(C_PROGRESS) | curses.A_BOLD)
@@ -800,11 +961,10 @@ class MC:
             except curses.error:
                 pass
         else:
-            # Idle state — show empty bar outline so layout is always visible
             try:
                 self.scr.attron(curses.color_pair(C_DIMMED))
-                self.scr.addstr(R_PROG_LBL, 0, _trunc(" Ready ", cols))
-                self.scr.addstr(R_PROG_BAR, 0, "\u2591" * min(cols - 1, cols))
+                self.scr.addstr(R_PROG_LBL, 0, _trunc(" Ready ", cols - 1))
+                self.scr.addstr(R_PROG_BAR, 0, "\u2591" * (cols - 1))
                 self.scr.attroff(curses.color_pair(C_DIMMED))
             except curses.error:
                 pass
@@ -813,19 +973,19 @@ class MC:
         pair = C_ERROR if self.msg_err else C_STATUS
         try:
             self.scr.attron(curses.color_pair(pair))
-            self.scr.addstr(R_MSG, 0, _trunc(" " + self.msg, cols))
+            self.scr.addstr(R_MSG, 0, _trunc(" " + self.msg, cols - 1))
             self.scr.attroff(curses.color_pair(pair))
         except curses.error:
             pass
 
         # ── key bar ───────────────────────────────────────────────────────────
-        keys = [("TAB","Swap"), ("↑↓","Move"), ("ENT","Open"),
-                ("←/-/U","Up"), ("F5/P","Upload"), ("F7/M","Mkdir"),
-                ("R","Refresh"), ("/","Filter"), ("S","Switch VC"),
-                ("C","Connect"), ("Q","Quit")]
+        keys = [("TAB", "Swap"), ("↑↓", "Move"), ("ENT", "Open"),
+                ("←/-/U", "Up"), ("F5/P", "Upload"), ("F7/M", "Mkdir"),
+                ("R", "Refresh"), ("/", "Filter"), ("S", "Switch VC"),
+                ("C", "Connect"), ("D", "Dump"), ("Q", "Quit")]
         try:
             self.scr.attron(curses.color_pair(C_NORMAL))
-            self.scr.addstr(R_KEYS, 0, " " * cols)
+            self.scr.addstr(R_KEYS, 0, " " * (cols - 1))
             self.scr.attroff(curses.color_pair(C_NORMAL))
             x = 0
             for k, lbl in keys:
@@ -855,7 +1015,7 @@ class MC:
             pass
 
     def _draw_col_header(self, row, col, width):
-        name_w = width - 12
+        name_w = max(4, width - 12)
         hdr    = _trunc("Name", name_w) + "       Size"
         try:
             self.scr.attron(curses.color_pair(C_INACTIVE) | curses.A_BOLD)
@@ -864,7 +1024,7 @@ class MC:
         except curses.error:
             pass
 
-    # ── render entries list ────────────────────────────────────────────────────
+    # ── render entries list ───────────────────────────────────────────────────
     def _draw_entries(self, top, left, width, height, entries, pane_idx,
                       is_local: bool):
         active = (self.active == pane_idx)
@@ -879,6 +1039,7 @@ class MC:
             offset = cursor
         if cursor >= offset + height:
             offset = cursor - height + 1
+        offset = max(0, offset)
         self.offsets[pane_idx] = offset
 
         size_w = 10
@@ -902,7 +1063,7 @@ class MC:
                     label   = prefix + entry.name
                     extra   = ""
                 else:
-                    is_dir  = entry.kind in (VSEntry.DIR, VSEntry.DATASTORE)
+                    is_dir = entry.kind in (VSEntry.DIR, VSEntry.DATASTORE)
                     if entry.kind == VSEntry.DATASTORE:
                         prefix  = "⊞ "
                         disp_sz = _fmt_size(entry.size)
@@ -912,17 +1073,14 @@ class MC:
                     else:
                         prefix  = "  "
                         disp_sz = _fmt_size(entry.size)
-                    label   = prefix + entry.name
-                    extra   = getattr(entry, "extra", "")
+                    label = prefix + entry.name
+                    extra = getattr(entry, "extra", "")
 
-                # If it's a datastore row, show extra info instead of size
+                # Datastore rows show capacity info instead of a size column
                 if not is_local and entry.kind == VSEntry.DATASTORE and extra:
-                    # Show name + extra squeezed into width
                     full_line = _trunc(label + "  " + extra, width)
-                    if selected:
-                        attr = curses.color_pair(C_SELECTED) | curses.A_BOLD
-                    else:
-                        attr = curses.color_pair(C_DIR)
+                    attr = (curses.color_pair(C_SELECTED) | curses.A_BOLD) if selected \
+                           else curses.color_pair(C_DIR)
                     self.scr.attron(attr)
                     self.scr.addstr(y, left, full_line[:width])
                     self.scr.attroff(attr)
@@ -947,9 +1105,7 @@ class MC:
                 pass
 
     def _draw_local(self, top, left, width, height):
-        filt    = self.filter[0].lower()
-        entries = [e for e in self.local.entries
-                   if not filt or filt in e.name.lower()]
+        entries = self._local_filtered()
         if not entries and not self.local.entries:
             try:
                 self.scr.addstr(top, left, _trunc(" (empty)", width))
@@ -964,118 +1120,138 @@ class MC:
                 self.scr.attron(curses.color_pair(C_DIMMED))
                 self.scr.addstr(top, left, _trunc(f" {self.vs.status}", width))
                 self.scr.attroff(curses.color_pair(C_DIMMED))
-                self.scr.addstr(top+1, left, _trunc(" C = connect  S = switch VC", width))
+                self.scr.addstr(top + 1, left, _trunc(" C = connect  S = switch VC", width))
             except curses.error:
                 pass
             return
-        filt    = self.filter[1].lower()
-        entries = [e for e in self.vs.entries
-                   if not filt or filt in e.name.lower()]
-        self._draw_entries(top, left, width, height, entries, 1, False)
+        self._draw_entries(top, left, width, height, self._vs_filtered(), 1, False)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Prompt helper
+    # Dialogs
     # ══════════════════════════════════════════════════════════════════════════
-    def _prompt(self, label: str, secret: bool = False,
-                initial: str = "") -> str:
+    def _prompt(self, label: str, secret: bool = False, initial: str = "") -> str:
         rows, cols, _, _ = self._dims()
         row   = rows // 2
         width = min(70, cols - 4)
         x     = (cols - width) // 2
         buf   = list(initial)
         curses.curs_set(1)
-        while True:
-            try:
-                self.scr.attron(curses.color_pair(C_HEADER))
-                self.scr.addstr(row, x, " " * width)
-                disp = "•" * len(buf) if secret else "".join(buf)
-                self.scr.addstr(row, x, _trunc(label + disp, width, pad=False))
-                self.scr.attroff(curses.color_pair(C_HEADER))
-                self.scr.refresh()
-            except curses.error:
-                pass
-            ch = self.scr.getch()
-            if ch in (10, 13):
-                break
-            elif ch == 27:
-                buf = []
-                break
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                if buf:
-                    buf.pop()
-            elif 32 <= ch < 127:
-                buf.append(chr(ch))
-        curses.curs_set(0)
+        self.scr.timeout(-1)          # block while the user types
+        try:
+            while True:
+                try:
+                    self.scr.attron(curses.color_pair(C_HEADER))
+                    self.scr.addstr(row, x, " " * width)
+                    disp = "•" * len(buf) if secret else "".join(buf)
+                    self.scr.addstr(row, x, _trunc(label + disp, width, pad=False))
+                    self.scr.attroff(curses.color_pair(C_HEADER))
+                    self.scr.refresh()
+                except curses.error:
+                    pass
+                ch = self.scr.getch()
+                if ch in (10, 13, curses.KEY_ENTER):
+                    break
+                elif ch == 27:
+                    buf = []
+                    break
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                elif 32 <= ch < 127:
+                    buf.append(chr(ch))
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(50)
         return "".join(buf)
 
     def _confirm_dialog(self, lines: List[str]) -> bool:
-        """Show a centred confirmation box. Returns True if user presses Y."""
+        """Centred confirmation box. Returns True if the user confirms."""
         rows, cols, _, _ = self._dims()
         width  = min(70, cols - 4)
-        height = len(lines) + 4   # border + lines + blank + [Y] [N] row
+        height = len(lines) + 4
         y = max(0, (rows - height) // 2)
-        x = max(0, (cols - width)  // 2)
+        x = max(0, (cols - width) // 2)
         curses.curs_set(0)
-        while True:
-            try:
-                # Box outline
-                self.scr.attron(curses.color_pair(C_HEADER))
-                self.scr.addstr(y, x, "┌" + "─" * (width - 2) + "┐")
-                for i, line in enumerate(lines):
-                    self.scr.addstr(y + 1 + i, x, "│" + _trunc(f"  {line}", width - 2) + "│")
-                self.scr.addstr(y + 1 + len(lines), x, "│" + " " * (width - 2) + "│")
-                btn = "│" + _trunc("      [ Y ] confirm       [ N ] cancel", width - 2, pad=True) + "│"
-                self.scr.addstr(y + 2 + len(lines), x, btn)
-                self.scr.addstr(y + 3 + len(lines), x, "└" + "─" * (width - 2) + "┘")
-                self.scr.attroff(curses.color_pair(C_HEADER))
-                self.scr.refresh()
-            except curses.error:
-                pass
-            ch = self.scr.getch()
-            if ch in (ord('y'), ord('Y'), ord('\n'), 10, 13):
-                return True
-            elif ch in (ord('n'), ord('N'), 27, ord('q'), ord('Q')):
-                return False
-        """Simple selection dialog; returns index or -1."""
+        self.scr.timeout(-1)
+        try:
+            while True:
+                try:
+                    self.scr.attron(curses.color_pair(C_HEADER))
+                    self.scr.addstr(y, x, "┌" + "─" * (width - 2) + "┐")
+                    for i, line in enumerate(lines):
+                        self.scr.addstr(y + 1 + i, x,
+                                        "│" + _trunc(f"  {line}", width - 2) + "│")
+                    self.scr.addstr(y + 1 + len(lines), x,
+                                    "│" + " " * (width - 2) + "│")
+                    btn = "│" + _trunc("      [ Y ] confirm       [ N ] cancel",
+                                       width - 2, pad=True) + "│"
+                    self.scr.addstr(y + 2 + len(lines), x, btn)
+                    self.scr.addstr(y + 3 + len(lines), x,
+                                    "└" + "─" * (width - 2) + "┘")
+                    self.scr.attroff(curses.color_pair(C_HEADER))
+                    self.scr.refresh()
+                except curses.error:
+                    pass
+                ch = self.scr.getch()
+                if ch in (ord('y'), ord('Y'), ord('\n'), 10, 13, curses.KEY_ENTER):
+                    return True
+                elif ch in (ord('n'), ord('N'), 27, ord('q'), ord('Q')):
+                    return False
+        finally:
+            self.scr.timeout(50)
+
+    def _pick_from_list(self, title: str, items: List[str]) -> int:
+        """Simple selection dialog; returns the chosen index, or -1 on cancel."""
         if not items:
             return -1
         rows, cols, _, _ = self._dims()
         width  = min(60, cols - 4)
-        height = min(len(items) + 2, rows - 4)
+        height = min(len(items) + 2, max(3, rows - 4))
         x      = (cols - width) // 2
         y      = (rows - height) // 2
         sel    = 0
+        top    = 0
+        visible = max(1, height - 2)
         curses.curs_set(0)
-        while True:
-            try:
-                self.scr.attron(curses.color_pair(C_HEADER))
-                self.scr.addstr(y, x, _trunc(f" {title} ", width))
-                self.scr.attroff(curses.color_pair(C_HEADER))
-                for i, item in enumerate(items):
-                    if i >= height - 2:
-                        break
-                    pair = C_SELECTED if i == sel else C_NORMAL
-                    self.scr.attron(curses.color_pair(pair))
-                    self.scr.addstr(y + 1 + i, x, _trunc(f"  {item}  ", width))
-                    self.scr.attroff(curses.color_pair(pair))
-                self.scr.refresh()
-            except curses.error:
-                pass
-            ch = self.scr.getch()
-            if ch == curses.KEY_UP:
-                sel = max(0, sel - 1)
-            elif ch == curses.KEY_DOWN:
-                sel = min(len(items) - 1, sel + 1)
-            elif ch in (10, 13):
-                return sel
-            elif ch == 27:
-                return -1
+        self.scr.timeout(-1)
+        try:
+            while True:
+                if sel < top:
+                    top = sel
+                if sel >= top + visible:
+                    top = sel - visible + 1
+                try:
+                    self.scr.attron(curses.color_pair(C_HEADER))
+                    self.scr.addstr(y, x, _trunc(f" {title} ", width))
+                    self.scr.attroff(curses.color_pair(C_HEADER))
+                    for i in range(visible):
+                        idx = top + i
+                        if idx >= len(items):
+                            self.scr.addstr(y + 1 + i, x, " " * width)
+                            continue
+                        pair = C_SELECTED if idx == sel else C_NORMAL
+                        self.scr.attron(curses.color_pair(pair))
+                        self.scr.addstr(y + 1 + i, x, _trunc(f"  {items[idx]}  ", width))
+                        self.scr.attroff(curses.color_pair(pair))
+                    self.scr.refresh()
+                except curses.error:
+                    pass
+                ch = self.scr.getch()
+                if ch == curses.KEY_UP:
+                    sel = max(0, sel - 1)
+                elif ch == curses.KEY_DOWN:
+                    sel = min(len(items) - 1, sel + 1)
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    return sel
+                elif ch in (27, ord('q'), ord('Q')):
+                    return -1
+        finally:
+            self.scr.timeout(50)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Actions
     # ══════════════════════════════════════════════════════════════════════════
     def _action_upload(self):
-        """Upload the selected local file to the current vSphere path."""
         if self._uploading:
             self.set_msg("Upload already in progress…", error=True)
             return
@@ -1090,18 +1266,18 @@ class MC:
             self.set_msg("Not connected to vSphere — press C to connect", error=True)
             return
         if not self.vs.current_ds_name:
-            self.set_msg("Navigate into a datastore (right pane) before uploading", error=True)
+            self.set_msg("Navigate into a datastore (right pane) before uploading",
+                         error=True)
             return
 
         local_path = entry.path
         ds_dest    = self.vs.current_ds_path()
 
-        confirmed = self._confirm_dialog([
+        if not self._confirm_dialog([
             f"File:        {entry.name}",
             f"Size:        {_fmt_size(entry.size)}",
             f"Destination: {ds_dest}",
-        ])
-        if not confirmed:
+        ]):
             self.set_msg("Upload cancelled")
             return
 
@@ -1116,7 +1292,6 @@ class MC:
                 with self._prog_lock:
                     self._prog_text = txt
                     self._prog_pct  = pct
-                # Wake the main curses loop immediately so bar repaints
                 try:
                     curses.ungetch(0)
                 except Exception:
@@ -1157,7 +1332,7 @@ class MC:
         user = self._prompt("Username: ")
         if not user:
             return
-        pwd  = self._prompt("Password: ", secret=True)
+        pwd = self._prompt("Password: ", secret=True)
         self._bg_connect(host, user, pwd)
 
     def _action_switch_vc(self):
@@ -1193,6 +1368,10 @@ class MC:
                     self.vs.enter(entry)
                     self.cursors[1] = 0
                     self.offsets[1] = 0
+                    try:
+                        curses.ungetch(0)
+                    except Exception:
+                        pass
                 threading.Thread(target=_browse, daemon=True).start()
 
     def _action_up(self):
@@ -1210,8 +1389,15 @@ class MC:
             self.local.refresh()
             self.set_msg("Local pane refreshed")
         else:
-            threading.Thread(target=self.vs.refresh, daemon=True).start()
-            self.set_msg("vSphere pane refreshing…")
+            def _do():
+                self.vs.refresh()
+                self.set_msg(f"vSphere pane refreshed — {self.vs.map_size()} VM folders mapped")
+                try:
+                    curses.ungetch(0)
+                except Exception:
+                    pass
+            threading.Thread(target=_do, daemon=True).start()
+            self.set_msg("vSphere pane refreshing (rebuilding VM folder map)…")
 
     # ── selection helpers ─────────────────────────────────────────────────────
     def _local_filtered(self):
@@ -1236,23 +1422,54 @@ class MC:
     def _move(self, delta: int):
         lst   = self._local_filtered() if self.active == 0 else self._vs_filtered()
         limit = max(0, len(lst) - 1)
-        self.cursors[self.active] = max(0, min(limit,
-                                               self.cursors[self.active] + delta))
+        self.cursors[self.active] = max(0, min(limit, self.cursors[self.active] + delta))
 
+    # ── diagnostics ───────────────────────────────────────────────────────────
     def _dump_uuid_map(self):
-        """Write the current uuid→name map to /tmp/vsphere_mc_debug.txt."""
+        """
+        Write the folder→VM map and the current pane contents to /tmp.
+
+        Use this to classify unresolved folders:
+          * folder appears under "Current pane entries" but nowhere in the map
+            → no registered VM in this vCenter owns a file in it (orphan, ISO
+              repo, or a VM registered in a different vCenter)
+          * folder appears in the map under a different datastore key
+            → same folder name reused across datastores
+        """
         path = "/tmp/vsphere_mc_debug.txt"
         try:
             with open(path, "w") as f:
-                f.write(f"vCenter: {self.vs.vc_host}\n")
-                f.write(f"Map status: {getattr(self.vs, '_uuid_map_error', 'n/a')}\n")
-                f.write(f"Total entries: {len(self.vs._uuid_to_name)}\n\n")
-                f.write("Current pane entries:\n")
+                f.write(f"vCenter    : {self.vs.vc_host}\n")
+                f.write(f"Datastore  : {self.vs.current_ds_name}\n")
+                f.write(f"Path       : {self.vs.current_path or '/'}\n")
+                f.write(f"Map status : {self.vs._uuid_map_error}\n\n")
+
+                f.write("=== Current pane entries ===\n")
                 for e in self.vs.entries:
-                    f.write(f"  fname={e.name!r}  ds_path={e.ds_path!r}  extra={e.extra!r}\n")
-                f.write("\nUUID map (folder_key → VM name):\n")
+                    mark = "OK " if e.extra else "-- "
+                    f.write(f"  {mark} raw={e.raw!r}  kind={e.kind}  "
+                            f"resolved={e.extra!r}\n")
+
+                f.write("\n=== Unresolved top-level folders ===\n")
+                for e in self.vs.entries:
+                    if e.kind == VSEntry.DIR and not e.extra:
+                        f.write(f"  {e.raw}\n")
+
+                f.write(f"\n=== Datastore-scoped folder map "
+                        f"({len(self.vs._folder_by_ds)}) ===\n")
+                for (ds, folder), vm in sorted(self.vs._folder_by_ds.items()):
+                    f.write(f"  [{ds}] {folder!r:50s} → {vm!r}\n")
+
+                f.write(f"\n=== Folder-name fallback map "
+                        f"({len(self.vs._folder_by_name)}) ===\n")
+                for k, v in sorted(self.vs._folder_by_name.items()):
+                    f.write(f"  {k!r:50s} → {v!r}"
+                            f"{'   (AMBIGUOUS)' if not v else ''}\n")
+
+                f.write(f"\n=== UUID map ({len(self.vs._uuid_to_name)}) ===\n")
                 for k, v in sorted(self.vs._uuid_to_name.items()):
-                    f.write(f"  {k!r:60s} → {v!r}\n")
+                    f.write(f"  {k!r:50s} → {v!r}\n")
+
             self.set_msg(f"Debug dump written to {path}")
         except Exception as exc:
             self.set_msg(f"Dump failed: {exc}", error=True)
@@ -1268,15 +1485,12 @@ class MC:
             if ch in (-1, 0):
                 continue   # timeout or synthetic wakeup — draw() repaints progress
 
-            # ── quit ──────────────────────────────────────────────────────────
             if ch in (ord('q'), ord('Q'), curses.KEY_F10):
                 break
 
-            # ── pane switch ───────────────────────────────────────────────────
             elif ch == 9:   # TAB
                 self.active = 1 - self.active
 
-            # ── movement ──────────────────────────────────────────────────────
             elif ch == curses.KEY_UP:
                 self._move(-1)
             elif ch == curses.KEY_DOWN:
@@ -1293,47 +1507,43 @@ class MC:
                 lst = self._local_filtered() if self.active == 0 else self._vs_filtered()
                 self.cursors[self.active] = max(0, len(lst) - 1)
 
-            # ── enter / open ──────────────────────────────────────────────────
             elif ch in (10, 13, curses.KEY_ENTER):
                 self._action_enter()
 
-            # ── go up ─────────────────────────────────────────────────────────
             elif ch in (curses.KEY_BACKSPACE, curses.KEY_LEFT, 127, 8,
                         ord('-'), ord('u'), ord('U')):
                 self._action_up()
 
-            # ── upload ────────────────────────────────────────────────────────
             elif ch in (curses.KEY_F5, ord('p'), ord('P')):
                 self._action_upload()
 
-            # ── mkdir ─────────────────────────────────────────────────────────
             elif ch in (curses.KEY_F7, ord('m'), ord('M')):
                 self._action_mkdir()
 
-            # ── refresh ───────────────────────────────────────────────────────
             elif ch in (ord('r'), ord('R')):
                 self._action_refresh()
 
-            # ── filter ────────────────────────────────────────────────────────
             elif ch == ord('/'):
                 self._action_filter()
 
-            # ── connect ───────────────────────────────────────────────────────
             elif ch in (ord('c'), ord('C')):
                 self._action_connect()
 
-            # ── switch vCenter ────────────────────────────────────────────────
             elif ch in (ord('s'), ord('S')):
                 self._action_switch_vc()
 
-            # ── clear filter ──────────────────────────────────────────────────
             elif ch == 27:   # ESC
                 self.filter[self.active] = ""
+                self.cursors[self.active] = 0
+                self.offsets[self.active] = 0
                 self.set_msg("Filter cleared")
 
-            # ── debug: dump uuid map to /tmp ──────────────────────────────────
             elif ch in (ord('d'), ord('D')):
                 self._dump_uuid_map()
+
+            elif ch == curses.KEY_RESIZE:
+                self.scr.erase()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
@@ -1359,11 +1569,13 @@ def _curses_main(stdscr, args):
             stdscr.getch()
 
     app = MC(stdscr, local_start=args.local or "~",
-             init_vc=init_vc, all_vcenters=all_vcenters)
+             init_vc=init_vc, all_vcenters=all_vcenters,
+             deep_map=not args.shallow_map)
     try:
         app.run()
     finally:
         app.vs.disconnect()
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1380,6 +1592,11 @@ def main():
 
     parser.add_argument("--local", default="~",
                         help="Starting directory for local pane (default: ~)")
+    parser.add_argument("--shallow-map", action="store_true",
+                        help="Skip the layoutEx.file property when building the "
+                             "folder→VM map. Much faster on large fleets, but only "
+                             "resolves VM home/log/snapshot folders, not disk-only "
+                             "folders on secondary datastores.")
     args = parser.parse_args()
 
     if not PYVMOMI_OK:
@@ -1394,6 +1611,7 @@ def main():
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
