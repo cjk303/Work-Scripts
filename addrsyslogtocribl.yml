@@ -1,0 +1,119 @@
+---
+- name: New CORDNSB rsyslog setup
+  hosts: cordnsb_servers
+  become: yes
+  vars:
+    cribl_eu_ip: "10.118.51.241"
+    # Uncomment and set as needed for other regions
+    # cribl_apac_ip: "10.94.51.241"
+    # cribl_amer_ip: "10.35.20.27"
+    rsyslog_named_logs_conf: /etc/rsyslog.d/30-named-logs.conf
+    rsyslog_default_conf: /etc/rsyslog.d/50-default.conf
+    apparmor_local_dir: /etc/apparmor.d/local
+    apparmor_rsyslogd_local: /etc/apparmor.d/local/usr.sbin.rsyslogd
+
+  tasks:
+    - name: Ensure AppArmor local directory exists
+      file:
+        path: "{{ apparmor_local_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Add AppArmor rule for rsyslogd to allow reading named logs
+      lineinfile:
+        path: "{{ apparmor_rsyslogd_local }}"
+        line: "/var/log/named/** r,"
+        create: yes
+
+    - name: Reload AppArmor profile for rsyslogd
+      command: apparmor_parser -r /etc/apparmor.d/usr.sbin.rsyslogd
+      ignore_errors: yes
+
+    - name: Deploy custom rsyslog configuration for named logs
+      copy:
+        dest: "{{ rsyslog_named_logs_conf }}"
+        content: |
+          module(load="imfile")
+          $InputFilePersistStateInterval 20000
+          $InputFileName /var/log/named/client.log
+          $InputFileTag named-client:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/database.log
+          $InputFileTag named-database:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/default.log
+          $InputFileTag named-default:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/dispatch.log
+          $InputFileTag named-dispatch:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/general.log
+          $InputFileTag named-general:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/network.log
+          $InputFileTag named-network:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/queries.log
+          $InputFileTag named-queries:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/resolver.log
+          $InputFileTag named-resolver:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/security.log
+          $InputFileTag named-security:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/xfer-in.log
+          $InputFileTag named-xferin:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/xfer-out.log
+          $InputFileTag named-xferout:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/lame-servers.log
+          $InputFileTag named-lame:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/notify.log
+          $InputFileTag named-notify:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/update.log
+          $InputFileTag named-update:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/unmatched.log
+          $InputFileTag named-unmatched:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/dnssec.log
+          $InputFileTag named-dnssec:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          $InputFileName /var/log/named/config.log
+          $InputFileTag named-config:
+          $InputFileFacility local3
+          $InputRunFileMonitor
+          # Forward to Cribl via UDP (EU example)
+          local3.* @{{ cribl_eu_ip }}:514
+
+    - name: Prevent duplication in /var/log/syslog
+      lineinfile:
+        path: "{{ rsyslog_default_conf }}"
+        regexp: '^(\*\.\*;auth,authpriv\.none)(\s+-/var/log/syslog)'
+        line: '*.*;auth,authpriv.none;local3.none -/var/log/syslog'
+        backrefs: yes
+
+    - name: Restart rsyslog
+      service:
+        name: rsyslog
+        state: restarted
