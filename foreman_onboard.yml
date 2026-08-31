@@ -1,0 +1,350 @@
+---
+- hosts: '*'
+  gather_facts: yes
+  become: yes
+  become_user: root
+  become_method: sudo
+
+  vars:
+    ansible_remote_tmp: /tmp
+
+    # Defaults. Override with -e or AWX extra vars.
+    ubuntup: "No"
+    wipe: "No"
+    foreman_host: "p054lnxfore01.epiqcorp.com"
+
+    ubuntu_keyring: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+    microsoft_keyring: /usr/share/keyrings/microsoft.gpg
+    katello_org_keyring: /etc/apt/keyrings/katello-epiq.gpg
+
+    ubuntu_repo_map:
+      "20":
+        codename: focal
+        rhsm_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_RHSM/RHSM_Ubuntu_20/ stable main"
+        rhsm_file: rhsm-ubuntu20
+        base_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_20_04/Ubuntu_20_04_Main_Focal/ focal main restricted universe multiverse"
+        base_file: base-ubuntu20
+        security_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_20_04/Ubuntu_20_04_Focal-Security/ focal-security main restricted universe multiverse"
+        security_file: security-ubuntu20
+        subscription_manager_pkg: python3-subscription-manager
+        katello_transport_pkg: apt-transport-katello
+        activationkey: "Ubuntu 20.04"
+
+      "22":
+        codename: jammy
+        rhsm_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_RHSM/RHSM_Ubuntu_22/ stable main"
+        rhsm_file: rhsm-ubuntu22
+        base_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_22_04_LTS/Ubuntu_22_04_Main/ jammy main restricted universe multiverse"
+        base_file: base-ubuntu22
+        security_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_22_04_LTS/Ubuntu_22_04_Security/ jammy-security main restricted universe multiverse"
+        security_file: security-ubuntu22
+        subscription_manager_pkg: python3-subscription-manager
+        katello_transport_pkg: apt-transport-go-katello
+        activationkey: "Ubuntu 22.04"
+
+      "24":
+        codename: noble
+        rhsm_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_RHSM/RHSM_Ubuntu_24/ stable main"
+        rhsm_file: rhsm-ubuntu24
+        base_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_24_LTS/Ubuntu_24_Main/ noble main restricted universe multiverse"
+        base_file: base-ubuntu24
+        security_repo: "deb [trusted=yes] http://{{ foreman_host }}/pulp/content/Epiq/Library/custom/Ubuntu_24_LTS/Ubuntu_24_Security/ noble-security main restricted universe multiverse"
+        security_file: security-ubuntu24
+        subscription_manager_pkg: python3-subscription-manager
+        katello_transport_pkg: apt-transport-go-katello
+        activationkey: "Ubuntu 24.04"
+
+    ubuntu24_repo_ids:
+      - { id: "Epiq_Ubuntu_24_LTS_Ubuntu_24_Main",      keyring: "{{ ubuntu_keyring }}" }
+      - { id: "Epiq_Ubuntu_24_LTS_Ubuntu_24_Updates",   keyring: "{{ ubuntu_keyring }}" }
+      - { id: "Epiq_Ubuntu_24_LTS_Ubuntu_24_Security",  keyring: "{{ ubuntu_keyring }}" }
+      - { id: "Epiq_Ubuntu_24_LTS_Ubuntu_24_Backports", keyring: "{{ ubuntu_keyring }}" }
+      - { id: "Epiq_Microsoft_Products_Repositories_MS_Prod_Ubuntu_24", keyring: "{{ microsoft_keyring }}" }
+      - { id: "Epiq_Ubuntu_RHSM_RHSM_Ubuntu_24", keyring: "{{ katello_org_keyring }}" }
+
+  pre_tasks:
+
+    - name: Detect OS from /etc/os-release
+      shell: |
+        if [ -r /etc/os-release ]; then
+          . /etc/os-release
+          echo "${ID:-unknown}"
+          echo "${VERSION_ID:-unknown}"
+          echo "${VERSION_ID%%.*}"
+          echo "${ID_LIKE:-}"
+          echo "${PRETTY_NAME:-unknown}"
+        elif [ -r /etc/redhat-release ]; then
+          echo "rhel"
+          awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit}}' /etc/redhat-release
+          awk '{for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {split($i,a,"."); print a[1]; exit}}' /etc/redhat-release
+          echo "rhel fedora"
+          cat /etc/redhat-release
+        else
+          echo "unknown"
+          echo "unknown"
+          echo "unknown"
+          echo ""
+          echo "unknown"
+        fi
+      args:
+        executable: /bin/bash
+      register: os_release_detect
+      changed_when: false
+
+    - name: Normalize detected OS values
+      set_fact:
+        detected_os_id: "{{ os_release_detect.stdout_lines[0] | default('unknown') | lower }}"
+        detected_distribution_version: "{{ os_release_detect.stdout_lines[1] | default('unknown') }}"
+        detected_distribution_major_version: "{{ os_release_detect.stdout_lines[2] | default('unknown') }}"
+        detected_id_like: "{{ os_release_detect.stdout_lines[3] | default('') | lower }}"
+        detected_pretty_name: "{{ os_release_detect.stdout_lines[4] | default('unknown') }}"
+
+    - name: Normalize platform flags
+      set_fact:
+        detected_distribution: >-
+          {% if detected_os_id == 'ubuntu' %}Ubuntu{% elif detected_os_id in ['rhel', 'redhat', 'redhatenterpriseserver'] %}RedHat{% elif detected_os_id in ['centos', 'rocky', 'almalinux'] %}RedHat{% else %}{{ detected_os_id }}{% endif %}
+        detected_os_family: >-
+          {% if detected_os_id == 'ubuntu' or 'debian' in detected_id_like %}Debian{% elif detected_os_id in ['rhel', 'redhat', 'redhatenterpriseserver', 'centos', 'rocky', 'almalinux'] or 'rhel' in detected_id_like or 'fedora' in detected_id_like %}RedHat{% else %}UNKNOWN{% endif %}
+        ubuntu_enabled: "{{ (ubuntup | default('No')) == 'Yes' }}"
+        wipe_enabled: "{{ (wipe | default('No')) == 'Yes' }}"
+
+    - name: Normalize Ubuntu repo config
+      set_fact:
+        ubuntu_repo_config: "{{ ubuntu_repo_map.get(detected_distribution_major_version, {}) }}"
+
+    - name: Diagnostics - detected OS
+      debug:
+        msg:
+          detected_os_family: "{{ detected_os_family }}"
+          detected_distribution: "{{ detected_distribution }}"
+          detected_os_id: "{{ detected_os_id }}"
+          detected_distribution_version: "{{ detected_distribution_version }}"
+          detected_distribution_major_version: "{{ detected_distribution_major_version }}"
+          detected_pretty_name: "{{ detected_pretty_name }}"
+          ubuntup: "{{ ubuntup }}"
+          wipe: "{{ wipe }}"
+          foreman_host: "{{ foreman_host }}"
+
+    - name: Fail if Ubuntu version is unsupported
+      fail:
+        msg: "Unsupported Ubuntu version detected: {{ detected_pretty_name }} / major={{ detected_distribution_major_version }}. Supported: 20, 22, 24."
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+        - ubuntu_repo_config | length == 0
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Disable stock Ubuntu sources to avoid public internet calls on fresh boxes
+    # -------------------------------------------------------------------------
+
+    - name: Rename deb822 ubuntu.sources if present
+      command: mv -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.orig
+      args:
+        removes: /etc/apt/sources.list.d/ubuntu.sources
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Rename legacy sources.list if present
+      command: mv -f /etc/apt/sources.list /etc/apt/sources.list.orig
+      args:
+        removes: /etc/apt/sources.list
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    # -------------------------------------------------------------------------
+    # Temporary Ubuntu RHSM/Base/Security repos
+    # -------------------------------------------------------------------------
+
+    - name: Add Ubuntu RHSM repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.rhsm_repo }}"
+        update_cache: yes
+        state: present
+        filename: "{{ ubuntu_repo_config.rhsm_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Add Ubuntu Base repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.base_repo }}"
+        update_cache: yes
+        state: present
+        filename: "{{ ubuntu_repo_config.base_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Add Ubuntu Security repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.security_repo }}"
+        update_cache: yes
+        state: present
+        filename: "{{ ubuntu_repo_config.security_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    # -------------------------------------------------------------------------
+    # Install subscription-manager and Katello transport
+    # -------------------------------------------------------------------------
+
+    - name: Install Ubuntu subscription-manager
+      apt:
+        name: "{{ ubuntu_repo_config.subscription_manager_pkg }}"
+        state: latest
+        update_cache: yes
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Install Ubuntu Katello transport
+      apt:
+        name: "{{ ubuntu_repo_config.katello_transport_pkg }}"
+        state: latest
+        update_cache: yes
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    # -------------------------------------------------------------------------
+    # Katello consumer cert
+    # -------------------------------------------------------------------------
+
+    - name: Download the Certificate required to subscribe
+      ansible.builtin.get_url:
+        url: "http://{{ foreman_host }}/pub/katello-rhsm-consumer"
+        dest: /tmp/katello-rhsm-consumer
+        force: true
+        mode: '0755'
+
+    - name: Run certificate installation
+      shell: "/bin/bash -x /tmp/katello-rhsm-consumer"
+      args:
+        executable: /bin/bash
+
+    # -------------------------------------------------------------------------
+    # Optional unregister/clean
+    # -------------------------------------------------------------------------
+
+    - name: Unregister Ubuntu system
+      command: subscription-manager unregister
+      ignore_errors: true
+      when:
+        - wipe_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Clean RHSM subscriptions - Ubuntu
+      command: subscription-manager clean
+      ignore_errors: true
+      when:
+        - wipe_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Clean RHSM subscriptions - RedHat
+      command: subscription-manager clean
+      ignore_errors: true
+      when:
+        - wipe_enabled
+        - detected_os_family == "RedHat"
+
+    # -------------------------------------------------------------------------
+    # Registration
+    # -------------------------------------------------------------------------
+
+    - name: Register Ubuntu using Subscription Manager
+      redhat_subscription:
+        state: present
+        activationkey: "{{ ubuntu_repo_config.activationkey }}"
+        force_register: true
+        org_id: Epiq
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Register RedHat 7 using Subscription Manager
+      command: subscription-manager register --org="Epiq" --activationkey="RedHat 7 Epiq"
+      when:
+        - detected_os_family == "RedHat"
+        - detected_distribution_major_version == "7"
+
+    - name: Register RedHat 8 using Subscription Manager
+      command: subscription-manager register --org="Epiq" --activationkey="RedHat 8 Epiq"
+      when:
+        - detected_os_family == "RedHat"
+        - detected_distribution_major_version == "8"
+
+    - name: Register RedHat 9 using Subscription Manager
+      command: subscription-manager register --org="Epiq" --activationkey="RedHat 9 Epiq"
+      when:
+        - detected_os_family == "RedHat"
+        - detected_distribution_major_version == "9"
+
+    # -------------------------------------------------------------------------
+    # Remove temporary Ubuntu repos
+    # -------------------------------------------------------------------------
+
+    - name: Remove Temporary Ubuntu Base Repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.base_repo }}"
+        update_cache: yes
+        state: absent
+        filename: "{{ ubuntu_repo_config.base_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Remove Temporary Ubuntu Security Repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.security_repo }}"
+        update_cache: yes
+        state: absent
+        filename: "{{ ubuntu_repo_config.security_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    - name: Remove Temporary Ubuntu RHSM Repository
+      apt_repository:
+        repo: "{{ ubuntu_repo_config.rhsm_repo }}"
+        update_cache: yes
+        state: absent
+        filename: "{{ ubuntu_repo_config.rhsm_file }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+
+    # -------------------------------------------------------------------------
+    # Ubuntu 24 Signed-By overrides
+    # -------------------------------------------------------------------------
+
+    - name: Ensure Signed-By overrides for Ubuntu 24 repos
+      command: >
+        subscription-manager repo-override
+        --repo={{ item.id }}
+        --add=Signed-By:{{ item.keyring }}
+      loop: "{{ ubuntu24_repo_ids }}"
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+        - detected_distribution_major_version == "24"
+      changed_when: true
+      register: override_results
+
+    - name: Refresh subscription data for Ubuntu 24
+      command: subscription-manager refresh
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
+        - detected_distribution_major_version == "24"
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      when:
+        - ubuntu_enabled
+        - detected_distribution == "Ubuntu"
