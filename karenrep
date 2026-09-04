@@ -1,0 +1,103 @@
+# Linux Estate — Vulnerability Assessment
+### Executive Summary & Remediation Plan
+
+**Scope:** Linux systems only, extracted from the Qualys vulnerability report. Windows, browser (Edge/Firefox), .NET, and Active Directory findings are out of scope for this analysis.
+**Status:** Initial analysis. Host counts and several environmental details are *inferred from scan data* and require confirmation before remediation is scheduled — see **Unknowns**.
+
+---
+
+## 1. Executive Summary
+
+The report surfaces roughly **2,700 Linux detections**, of which about **450 are rated Critical**. Those headline numbers overstate the actual body of work. Vulnerability scanners count every CVE on every host as a separate line-item, so a single missing kernel update generates dozens of entries, and one host that is a patch cycle behind can trip several hundred. Consolidated by root cause, the Linux estate resolves to a **small number of distinct problems replicated across an estimated 25–27 hosts.**
+
+The estate divides into two populations that need to be handled differently:
+
+- **Patchable now** — the great majority. AlmaLinux, Oracle Linux, and Ubuntu hosts are behind on standard OS patching. The overwhelming bulk of all detections, criticals included, is cleared by a routine `update + reboot` on each host. This is maintenance-window work, not project work.
+- **Requires lifecycle / migration** — a smaller but higher-consequence set. The MySQL and Oracle Java estates are years behind, and MySQL in particular is running **end-of-life software that no longer receives security patches at all.** These cannot be "patched current"; they require version migration and belong in planning, not a patch window.
+
+The single most important message for stakeholders: **the volume is not the risk. A disciplined patch sweep collapses the number dramatically, which then isolates a short list of genuinely serious items — led by the end-of-life MySQL estate — that warrant dedicated attention.**
+
+### Estate at a glance
+
+| Cohort | Est. hosts | Patch posture | Primary action |
+|---|---|---|---|
+| AlmaLinux | ~17 | 1–2 cycles behind | OS update + reboot |
+| Oracle Linux (OEL) | ~8 | ~12 months behind (kernel & base) | OS update + reboot; confirm kernel stream |
+| MySQL | ~8 (roles on above hosts) | **~4 years behind + End-of-Life** | **Migrate off 8.0 → 8.4 LTS** |
+| MongoDB | ~3 (roles on above hosts) | ~1 version behind | Point-release upgrade |
+| Oracle Java SE | ~1 (role on above host) | ~2 years behind | Inventory & update all JDKs; review licensing |
+| Ubuntu | ~1–2 | Mixed | Kernel update + reboot |
+
+*Note: the database and Java findings are **software roles running on the OS hosts above**, not additional machines. The true unique host count is driven by the OS cohorts (~17 Alma + ~8 OEL + ~1–2 Ubuntu).*
+
+---
+
+## 2. The Worst Problems
+
+Ranked by a combination of severity, exploitability score (QDS), remediation difficulty, and blast radius.
+
+**1. End-of-Life MySQL 8.0 estate — highest priority.**
+Flagged at maximum exploitability score (**QDS 100, Severity 5**) across ~8 hosts. MySQL 8.0 reached end of life in **April 2026**, so these databases now receive **no security updates whatsoever** — future vulnerabilities will never be fixed on this version. Compounding this, the same hosts carry open Critical Patch Updates going back to **2022**, meaning ~4 years of unapplied database patches. This is the estate's most serious exposure and the only item that cannot be resolved by patching. **Remediation is a migration to MySQL 8.4 LTS (or 9.x), scoped as a project.**
+
+**2. Cross-fleet kernel vulnerability — "DirtyFrag" (CVE-2026-43284 / CVE-2026-43500).**
+Appears in the outstanding kernel updates for **AlmaLinux, Oracle Linux, and Ubuntu** at **QDS 95**. Because it spans all three OS cohorts, it is the most widespread high-severity item in the report. It was the subject of a prior remediation effort, so the fix path is understood: the same kernel update that clears the rest of the base-OS backlog remediates it. Recommended as the anchor of the immediate patching push. *(Live exploitation status should be verified against CISA KEV — see Unknowns.)*
+
+**3. Oracle Linux — ~12-month patch debt.**
+The OEL cohort carries open errata dating to **2025**, including kernel updates, versus ~1–2 cycles for AlmaLinux. Open year-old kernel errata is the largest single block of patch debt in the estate. The remediation is routine (`update + reboot`), but the *degree* of lag suggests an underlying process gap (see Unknowns — patch source / subscription state), which matters more than the individual CVEs.
+
+**4. Oracle Java SE — two QDS-95 criticals on ~1 host.**
+Small in count but not in risk: Java SE is a historically heavily-targeted class of vulnerability, and this install is ~2 years behind. The host appears to carry **multiple JDK Critical Patch Updates simultaneously**, which usually indicates several Java installations layered on one machine (a system JDK plus JDKs bundled inside application directories). Remediation requires **inventorying every Java binary on the host**, not a single OS update, and should include a **licensing review** (Oracle JDK is subscription-licensed; a free OpenJDK/Temurin build may be the better fix).
+
+**5. Samba (QID: QDS 95, AlmaLinux + Oracle Linux) — conditional.**
+High exploitability score and remediated by the standard OS update. Priority escalates sharply **if any of these hosts serve files**; negligible if Samba is installed but unused. Confirming role is a five-minute check that changes the ranking.
+
+*Also present and trivially fixed within the standard patch sweep, but worth naming to stakeholders because they get asked about: `sudo` (privilege-escalation, CVE-2026-35535) and `openssh` — both remote/privilege-relevant, both cleared by the OS update.*
+
+---
+
+## 3. Remediation Plan
+
+Phased so that the highest-risk, lowest-effort work happens first and the collapse in numbers is visible early. Timeframes are indicative — actual scheduling depends on the change-management process, which I have not yet learned.
+
+**Phase 0 — Confirm the picture (before any change).**
+Pull the vulnerability export **grouped by asset** to convert inferred host counts into a confirmed inventory, verify which hosts overlap (especially MySQL-EOL vs MySQL-CPU), and identify OS versions and kernel streams. Confirm backups/snapshots exist for every host that will be rebooted or migrated. This is a data pull, not a change, and de-risks everything downstream.
+
+**Phase 1 — Immediate, high-priority patching (next available window).**
+Target the QDS-95 items across the OS cohorts in one push: the kernel updates (which remediate DirtyFrag), Samba, `sudo`, and `openssh`. On the Java host, inventory and update/remove all JDKs. These are the items where severity and exploitability are highest and the fix is already available.
+
+**Phase 2 — Bulk OS remediation (subsequent windows).**
+Run a full `update + reboot` across the AlmaLinux (~17), Oracle Linux (~8), and Ubuntu (~1–2) cohorts. This single action clears the **overwhelming majority of all ~2,700 detections**, criticals included, because current packages supersede the long chains of older CVEs. Best executed through existing automation (e.g. Ansible/AWX) for consistency and auditability. Sequence non-production first; reboots are required for kernel fixes to take effect.
+
+**Phase 3 — Lifecycle & migration (into planning / next quarter).**
+- **MySQL:** migrate ~8 hosts from EOL 8.0 to **8.4 LTS** (or 9.x). Requires compatibility testing, a maintenance window per host, and rollback planning. This is the estate's key project-level item.
+- **MongoDB:** upgrade ~3 hosts to a current point release — low-risk, can ride alongside Phase 2.
+- **Java:** standardise the remaining JDK(s) on a supported, appropriately-licensed build.
+
+**Phase 4 — Address the root cause (ongoing).**
+The ~12-month Oracle Linux lag and the ~4-year MySQL lag are symptoms of a patching/lifecycle process gap, not one-off oversights. Once the backlog is cleared, establish a regular patch cadence and an EOL-tracking practice so the estate does not drift back to this state.
+
+---
+
+## 4. Unknowns — Questions to Resolve
+
+This analysis is built entirely from a point-in-time scan. The following are **not yet known** and materially affect prioritisation and scheduling. Several should be answered before Phase 1.
+
+**Host inventory and overlap.** Host counts throughout are *inferred* from detection-count patterns in the scan; the arithmetic is consistent but unconfirmed. A per-asset export is needed to establish the real inventory and to confirm whether the EOL-MySQL and patch-lagged-MySQL findings are the same ~8 hosts (assumed, not proven).
+
+**Network exposure.** The scan does not indicate which hosts are internet-facing versus internal-only. A QDS-95 vulnerability on an exposed host is a different risk than the same finding on an isolated one. This is the single biggest driver of *real* priority and is not derivable from the data I have.
+
+**Business criticality.** I don't yet know which hosts are production, which carry critical workloads, or which can tolerate a reboot/maintenance window and when. This determines the achievable pace of Phases 1–3.
+
+**Patch source & subscription state (Oracle Linux especially).** How these hosts receive updates — subscription, public repositories, or automation-driven — is unknown, and is very likely *why* the OEL cohort drifted ~12 months. Some hosts may be unsubscribed or offline from patching entirely. Needs confirmation.
+
+**Oracle Linux kernel stream (UEK vs RHCK).** OEL can boot either the Unbreakable Enterprise Kernel or the Red Hat-compatible kernel. Remediation must target the stream actually in use, or findings will not clear after reboot. A quick `uname -r` check across the cohort resolves this.
+
+**Live exploitation status.** Several top items are 2026 CVEs. Their current real-world exploitation status and CISA KEV listing should be verified against live threat-intelligence sources to sharpen the "do first" ordering beyond the scanner's own score.
+
+**Scan completeness.** Whether the scan was fully authenticated/credentialed is unconfirmed; an unauthenticated scan can under-report. Worth verifying so we know the ~2,700 figure is a floor, not a partial view.
+
+**Backup / rollback posture.** Before any reboot or the MySQL migration, confirmed backups and a tested rollback path are prerequisites. Current state unknown.
+
+---
+
+*This is an initial assessment from a first review of the scan data. Figures marked as estimates will be finalised once the per-asset export and the environmental details above are available.*
