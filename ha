@@ -1,244 +1,29 @@
-#---------------------------------------------------------------------
-# Example configuration for a possible web application.  See the
-# full configuration options online.
-#
-#   https://www.haproxy.org/download/1.8/doc/configuration.txt
-#
-#---------------------------------------------------------------------
-
-#---------------------------------------------------------------------
-# Global settings
-#---------------------------------------------------------------------
-global
-    # to have these messages end up in /var/log/haproxy.log you will
-    # need to:
-    #
-    # 1) configure syslog to accept network log events.  This is done
-    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
-    #    /etc/sysconfig/syslog
-    #
-    # 2) configure local2 events to go to the /var/log/haproxy.log
-    #   file. A line like the following can be added to
-    #   /etc/sysconfig/syslog
-    #
-    #    local2.*                       /var/log/haproxy.log
-    #
-    log         127.0.0.1 local2
-
-    chroot      /var/lib/haproxy
-    pidfile     /var/run/haproxy.pid
-    maxconn     4000
-    user        haproxy
-    group       haproxy
-    daemon
-
-    # turn on stats unix socket
-    stats socket /var/lib/haproxy/stats
-    stats socket *:1999 level admin
-    stats socket /var/run/haproxy.sock mode 600 level admin
-    server-state-file /etc/haproxy/haproxy.state
-
-    # utilize system-wide crypto-policies
-    ssl-default-bind-ciphers PROFILE=SYSTEM
-    ssl-default-server-ciphers PROFILE=SYSTEM
-
-#---------------------------------------------------------------------
-# common defaults that all the 'listen' and 'backend' sections will
-# use if not designated in their block
-#---------------------------------------------------------------------
-defaults
-    mode                    http
-    log                     global
-    option                  httplog
-    option                  dontlognull
-    option http-server-close
-    option forwardfor       except 127.0.0.0/8
-    option                  redispatch
-    retries                 3
-    timeout http-request    10s
-    timeout queue           1m
-    timeout connect         10s
-    timeout client          1m
-    timeout server          1m
-    timeout http-keep-alive 10s
-    timeout check           10s
-    maxconn                 3000
-
-#---------------------------------------------------------------------
-# main frontend which proxys to the backends
-#---------------------------------------------------------------------
-frontend main
-    bind *:5000
-    acl url_static       path_beg       -i /static /images /javascript /stylesheets
-    acl url_static       path_end       -i .jpg .gif .png .css .js
-
-    use_backend static          if url_static
-    default_backend             app
-
-#---------------------------------------------------------------------
-# static backend for serving up images, stylesheets and such
-#---------------------------------------------------------------------
-backend static
-    balance     roundrobin
-    server      static 127.0.0.1:4331 check
-
-#---------------------------------------------------------------------
-# round robin balancing between the various backends
-#---------------------------------------------------------------------
-backend app
-    balance     roundrobin
-    server  app1 127.0.0.1:5001 check
-    server  app2 127.0.0.1:5002 check
-    server  app3 127.0.0.1:5003 check
-    server  app4 127.0.0.1:5004 check
-
-
-#listen rdfarm01
-#    bind 10.50.40.110:4000
-#    mode tcp
-#    maxconn 22000
-#    balance roundrobin
-#    server 10.50.40.133 10.50.40.133:4000 check
-
-listen stats
-    bind *:8085
-    stats enable
-    mode http
-        maxconn 10
-
-        timeout client  100s
-        timeout server  100s
-        timeout connect 100s
-        timeout queue   100s
-
-        stats enable
-        stats hide-version
-        stats refresh 30s
-        stats show-node
-        stats auth admin:HemmingWay2010
-        stats uri /stats
-        stats admin if TRUE
-
-listen rdfarm19
-    bind 10.50.40.140:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.111 10.50.40.111:3389 check
-
-
-listen rdfarm19-mfa
-    bind 10.50.40.140:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.111-mfa 10.50.40.111:4000 check
-
-
-listen rdfarm19365
-    bind 10.50.40.30:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.133 10.50.40.133:3389 check
-    server 10.50.40.134 10.50.40.134:3389 check
-    server 10.50.40.135 10.50.40.135:3389 check
-    server 10.50.40.138 10.50.40.138:3389 check
-    server 10.50.40.139 10.50.40.139:3389 check
-    server 10.50.40.141 10.50.40.141:3389 check
-    server 10.50.40.142 10.50.40.142:3389 check
-    server 10.50.40.143 10.50.40.143:3389 check
-    server 10.50.40.144 10.50.40.144:3389 check
-    server 10.50.40.145 10.50.40.145:3389 check
-    server 10.50.40.146 10.50.40.146:3389 check
-
-
-
-listen rdfarm19365mfa
-    bind 10.50.40.30:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.133-mfa 10.50.40.133:4000 check
-    server 10.50.40.134-mfa 10.50.40.134:4000 check
-    server 10.50.40.135-mfa 10.50.40.135:4000 check
-    server 10.50.40.138-mfa 10.50.40.138:4000 check
-    server 10.50.40.139-mfa 10.50.40.139:4000 check
-    server 10.50.40.141-mfa 10.50.40.141:4000 check
-    server 10.50.40.142-mfa 10.50.40.142:4000 check
-    server 10.50.40.143-mfa 10.50.40.143:4000 check
-    server 10.50.40.144-mfa 10.50.40.144:4000 check
-    server 10.50.40.145-mfa 10.50.40.145:4000 check
-    server 10.50.40.146-mfa 10.50.40.146:4000 check
-
-
-
-
-
-
-listen RDFarmSXA
-    bind 10.50.40.120:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.121 10.50.40.121:3389 check
-    server 10.50.40.122 10.50.40.122:3389 check
-    server 10.50.40.123 10.50.40.123:3389 check
-
-
-listen RDFarmSXAmfa
-    bind 10.50.40.120:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.121-mfa 10.50.40.121:4000 check
-    server 10.50.40.122-mfa 10.50.40.122:4000 check
-    server 10.50.40.123-mfa 10.50.40.123:4000 check
-
-listen RDFarm22SXA
-    bind 10.50.40.150:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.124 10.50.40.124:3389 check
-
-
-listen RDFarm22SXAmfa
-    bind 10.50.40.150:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.124-mfa 10.50.40.124:4000 check
-
-
-listen RDFarm365
-    bind 10.50.40.130:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.161 10.50.40.161:3389 check
-
-
-listen RDFarm365mfa
-    bind 10.50.40.130:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.161-mfa 10.50.40.161:4000 check
-
-
-listen RDFarm01
-    bind 10.50.40.100:3389
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.101 10.50.40.101:3389 check
-
-
-listen RDFarm01mfa
-    bind 10.50.40.100:4000
-    mode tcp
-    maxconn 22000
-    balance roundrobin
-    server 10.50.40.101-mfa 10.50.40.101:4000 check
-
+[NOTICE]   (58565) : haproxy version is 2.8.14-c23fe91
+[NOTICE]   (58565) : path to executable is /usr/sbin/haproxy
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'rdfarm19' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'rdfarm19-mfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'rdfarm19365' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'rdfarm19365mfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarmSXA' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarmSXAmfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm22SXA' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm22SXAmfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm365' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm365mfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm01' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : parsing [haproxy.cfg:52] : 'option httplog' not usable with proxy 'RDFarm01mfa' (needs 'mode http'). Falling back to 'option tcplog'.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'rdfarm19' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'rdfarm19-mfa' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'rdfarm19365' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'rdfarm19365mfa' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarmSXA' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarmSXAmfa' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm22SXA' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm22SXAmfa' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm365' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm365mfa' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm01' as it requires HTTP mode.
+[WARNING]  (58565) : config : 'option forwardfor' ignored for proxy 'RDFarm01mfa' as it requires HTTP mode.
+[NOTICE]   (58565) : config : config: Can't open global server state file '/etc/haproxy/haproxy.state': No such file or directory
+Warnings were found.
+Configuration file is valid
