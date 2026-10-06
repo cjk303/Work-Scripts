@@ -1,3 +1,8 @@
------ PREFLIGHT (copy 1 doc to prove the link works) -----
-Preflight did NOT copy a doc. Response:
-{"error":{"root_cause":[{"type":"parsing_exception","reason":"Unknown key for a VALUE_NUMBER in [max_docs].","line":1,"col":22}],"type":"x_content_parse_exception","reason":"[2:86] [reindex] failed to parse field [source]","caused_by":{"type":"parsing_exception","reason":"Unknown key for a VALUE_NUMBER in [max_docs].","line":1,"col":22}},"status":400}
+SRC=https://SOURCE_IP:9200; OS=https://localhost:9200
+curl -sk -u admin:ksdjhfskjdhl -H 'Content-Type: application/json' \
+  -XPOST "$OS/_reindex" -d "{
+    \"max_docs\":1,
+    \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
+      \"index\":\"gladsaxe-2026.10\",\"size\":1},
+    \"dest\":{\"index\":\"zz-test\"}}"
+curl -sk -u admin:ksdjhfskjdhl -XDELETE "$OS/zz-test"
