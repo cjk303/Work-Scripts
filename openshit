@@ -1,59 +1,34 @@
-root@prod-oes-elk01:/home/rundeck# ls -l /home/xxujd/elasticsearch_opendistro/
-total 96
--rw-rw-r-- 1 xxujd xxujd   49 Mar  8  2022 action_groups.yml
--rw-rw-r-- 1 xxujd xxujd 2573 Jul  1  2022 config.yml
--rw-rw-r-- 1 xxujd xxujd 1180 May 22  2024 custom-opensearch_dashboards.yml
--rw-r--r-- 1 root  root  4316 Aug 31 08:23 docker-compose.yml
--rw-r--r-- 1 root  root  3917 Jun 11  2024 docker-compose.yml_
-drwxr-xr-x 4 xxujd xxujd 4096 Nov 25  2022 elk-cert
-drwxr-xr-x 4 xxujd xxujd 4096 Apr 14  2022 elk-cert_
--rw-r--r-- 1 xxujd xxujd 1705 Jun 11  2024 esnode-key.pem
--rw-rw-rw- 1 xxujd xxujd 1721 Jun 11  2024 esnode.pem
--rw-rw-r-- 1 xxujd xxujd 1324 Mar  9  2022 internal_users.yml
--rw-r--rw- 1 xxujd xxujd  107 Oct  4  2024 java.security
--rw-r--r-- 1 xxujd xxujd 6597 Feb 21  2025 logstash.conf
--rw-r--r-- 1 root  root  6598 Jan 20  2025 logstash.conf_
--rw-rw-rw- 1 xxujd xxujd 2512 Aug 31 07:47 opensearch.yml
--rw-rw-r-- 1 xxujd xxujd  335 Mar  8  2022 readme.md
--rw-rw-r-- 1 xxujd xxujd  972 Jun 28  2022 roles_mapping.yml
--rw-rw-r-- 1 xxujd xxujd 5921 Mar  8  2022 roles.yml
--rw-r--r-- 1 xxujd xxujd 1445 Jun 11  2024 root-ca.pem
--rw-rw-r-- 1 xxujd xxujd   64 Mar  8  2022 run.sh
--rw-rw-r-- 1 xxujd xxujd  170 Mar  8  2022 tenants.yml
-root@prod-oes-elk01:/home/rundeck# docker cp /home/xxujd/elasticsearch_opendistro/kirk.pem opensearch-node1:/tmp/
-lstat /home/xxujd/elasticsearch_opendistro/kirk.pem: no such file or directory
-root@prod-oes-elk01:/home/rundeck# docker cp /home/xxujd/elasticsearch_opendistro/kirk-key.pem opensearch-node1:/tmp/
-lstat /home/xxujd/elasticsearch_opendistro/kirk-key.pem: no such file or directory
-root@prod-oes-elk01:/home/rundeck# openssl x509 -in /home/xxujd/elasticsearch_opendistro/root-ca.pem -noout -subject
-subject=DC = com, DC = example, O = Example Com Inc., OU = Example Com Inc. Root CA, CN = Example Com Inc. Root CA
-root@prod-oes-elk01:/home/rundeck# docker exec -it opensearch-node1 bash
-[opensearch@bbb94e0fa43f ~]$ cd /usr/share/opensearch/plugins/opensearch-security/tools
-[opensearch@bbb94e0fa43f tools]$ extract() {
->   awk -v want="/$1\"" '
->     /-----BEGIN/ {buf=""; cap=1}
->     cap {l=$0; sub(/^echo "/,"",l); sub(/".*$/,"",l); buf=buf l "\n"}
->     /-----END/ {cap=0}
->     index($0, want) {printf "%s", buf}
->   ' install_demo_configuration.sh > /tmp/$1
-> }
-[opensearch@bbb94e0fa43f tools]$ extract kirk.pem
-[opensearch@bbb94e0fa43f tools]$ extract kirk-key.pem
-[opensearch@bbb94e0fa43f tools]$ extract() {
->   awk -v want="/$1\"" '
->     /-----BEGIN/ {buf=""; cap=1}
->     cap {l=$0; sub(/^echo "/,"",l); sub(/".*$/,"",l); buf=buf l "\n"}
->     /-----END/ {cap=0}
->     index($0, want) {printf "%s", buf}
->   ' install_demo_configuration.sh > /tmp/$1
-> }
-[opensearch@bbb94e0fa43f tools]$ extract kirk.pem
-[opensearch@bbb94e0fa43f tools]$ extract kirk-key.pem
-[opensearch@bbb94e0fa43f tools]$ openssl x509 -in /tmp/kirk.pem -noout -subject -issuer
-bash: openssl: command not found
-[opensearch@bbb94e0fa43f tools]$ openssl x509 -in /tmp/kirk.pem -noout -modulus | md5sum
-bash: openssl: command not found
-d41d8cd98f00b204e9800998ecf8427e  -
-[opensearch@bbb94e0fa43f tools]$ openssl rsa  -in /tmp/kirk-key.pem -noout -modulus | md5sum
-bash: openssl: command not found
-d41d8cd98f00b204e9800998ecf8427e  -
-[opensearch@bbb94e0fa43f tools]$
+There are also two promising leads in that directory: elk-cert/ might hold the admin cert, and the compose, Logstash and readme files might just contain the password. Check those first, on the host:
+
+bash
+cd /home/xxujd/elasticsearch_opendistro
+
+# Might already have the password
+grep -niE 'user|pass' docker-compose.yml custom-opensearch_dashboards.yml logstash.conf readme.md run.sh
+
+# Might have the admin cert
+find elk-cert elk-cert_ -type f -ls
+
+Then check what the extraction produced:
+
+bash
+docker exec opensearch-node1 wc -c /tmp/kirk.pem /tmp/kirk-key.pem
+docker cp opensearch-node1:/tmp/kirk.pem /tmp/
+docker cp opensearch-node1:/tmp/kirk-key.pem /tmp/
+
+openssl x509 -in /tmp/kirk.pem -noout -subject -issuer
+openssl x509 -in /tmp/kirk.pem -noout -modulus | md5sum
+openssl rsa  -in /tmp/kirk-key.pem -noout -modulus | md5sum
+
+You want to see:
+
+Subject: CN=kirk,OU=client,O=client,L=test,C=de
+Issuer: the Example Com Inc. Root CA
+Hashes: the two modulus hashes identical
+
+If wc shows 0 bytes, the script's format differs from what the awk expects. Paste the output of this and I'll adjust it:
+
+bash
+docker exec opensearch-node1 grep -n -B2 -A2 'kirk' /usr/share/opensearch/plugins/opensearch-security/tools/install_demo_configuration.sh | head -40
+
+If everything checks out, go back into the container and run step 3 from before. The files are already in /tmp there.
