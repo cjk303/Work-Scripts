@@ -1,6 +1,4 @@
-1. Stop any task still running
-bash
-AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
+root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
 c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
 
 c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
@@ -10,35 +8,37 @@ for n in json.load(sys.stdin).get("nodes",{}).values():
     [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
   c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
 done
-2. Find out why 0 docs came over
+{
+    "nodes": {}
+}
+root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
+c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
 
-Near-certain cause: the two clone-side prerequisites weren't applied, so remote reindex connected but fetched nothing. Confirm with a one-document test that runs synchronously and prints the real error:
-
-bash
-SRC=https://SOURCE_IP:9200
-c -XPOST '_reindex' -d "{
-  \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
-    \"index\":\"gladsaxe-2026.10\",\"size\":1,\"max_docs\":1},
-  \"dest\":{\"index\":\"zz-test\"}}"
-If it says something about whitelist → you never added reindex.remote.whitelist to the clone's opensearch.yml.
-If it mentions ssl/certificate/handshake → you're missing reindex.ssl.verification_mode: none.
-Add whichever is missing, docker compose up -d the clone, and the test returns created: 1.
-
-Clean up the probe afterward: c -XDELETE zz-test -o /dev/null.
-
-3. Repopulate — no drop, no mapping copy
-
-Once the test copies 1 doc, refill with reindex auto-creating each index (correct dynamic mapping, nothing to drop since they're already empty):
-
-bash
-SRC=https://SOURCE_IP:9200
-for i in gladsaxe-2026.08 gladsaxe-2026.09 gladsaxe-2026.10; do
-  echo "=== $i ==="
-  c -XPOST "_reindex?wait_for_completion=false&slices=auto" -d "{
-    \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\",
-      \"socket_timeout\":\"5m\"},\"index\":\"$i\",\"size\":2000},
-    \"dest\":{\"index\":\"$i\"}}"
-  echo
-done
-# watch progress:
 c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
+# cancel whatever's listed:
+for t in $(c '_tasks?actions=*reindex' | python3 -c 'import sys,json
+for n in json.load(sys.stdin).get("nodes",{}).values():
+    [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
+  c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
+done
+{
+    "nodes": {}
+}
+root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
+c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
+
+c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
+# cancel whatever's listed:
+for t in $(c '_tasks?actions=*reindex' | python3 -c 'import sys,json
+for n in json.load(sys.stdin).get("nodes",{}).values():
+    [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
+  c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
+done
+{
+    "nodes": {}
+}
+root@prod-oes-elk01:~# c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
+{
+    "nodes": {}
+}
+root@prod-oes-elk01:~#
