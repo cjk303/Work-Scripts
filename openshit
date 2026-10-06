@@ -1,34 +1,39 @@
-There are also two promising leads in that directory: elk-cert/ might hold the admin cert, and the compose, Logstash and readme files might just contain the password. Check those first, on the host:
-
-bash
-cd /home/xxujd/elasticsearch_opendistro
-
-# Might already have the password
-grep -niE 'user|pass' docker-compose.yml custom-opensearch_dashboards.yml logstash.conf readme.md run.sh
-
-# Might have the admin cert
-find elk-cert elk-cert_ -type f -ls
-
-Then check what the extraction produced:
-
-bash
-docker exec opensearch-node1 wc -c /tmp/kirk.pem /tmp/kirk-key.pem
-docker cp opensearch-node1:/tmp/kirk.pem /tmp/
-docker cp opensearch-node1:/tmp/kirk-key.pem /tmp/
-
-openssl x509 -in /tmp/kirk.pem -noout -subject -issuer
-openssl x509 -in /tmp/kirk.pem -noout -modulus | md5sum
-openssl rsa  -in /tmp/kirk-key.pem -noout -modulus | md5sum
-
-You want to see:
-
-Subject: CN=kirk,OU=client,O=client,L=test,C=de
-Issuer: the Example Com Inc. Root CA
-Hashes: the two modulus hashes identical
-
-If wc shows 0 bytes, the script's format differs from what the awk expects. Paste the output of this and I'll adjust it:
-
-bash
-docker exec opensearch-node1 grep -n -B2 -A2 'kirk' /usr/share/opensearch/plugins/opensearch-security/tools/install_demo_configuration.sh | head -40
-
-If everything checks out, go back into the container and run step 3 from before. The files are already in /tmp there.
+root@prod-oes-elk01:/home/rundeck# cd /home/xxujd/elasticsearch_opendistro
+root@prod-oes-elk01:/home/xxujd/elasticsearch_opendistro# grep -niE 'user|pass' docker-compose.yml custom-opensearch_dashboards.yml logstash.conf readme.md run.sh
+docker-compose.yml:18:        soft: 65536 # maximum number of open files for the OpenSearch user, set to at least 65536 on modern systems
+docker-compose.yml:23:      - ./internal_users.yml:/usr/share/opensearch/plugins/opensearch-security/securityconfig/internal_users.yml
+docker-compose.yml:59:      - ./internal_users.yml:/usr/share/opensearch/plugins/opensearch-security/securityconfig/internal_users.yml
+custom-opensearch_dashboards.yml:20:opensearch.username: "kibanaserver"
+custom-opensearch_dashboards.yml:21:opensearch.password: 'gfG%^fgsdf'
+logstash.conf:83:      user => admin
+logstash.conf:84:      password => ksdjhfskjdhl
+logstash.conf:93:      user => admin
+logstash.conf:94:      password => ksdjhfskjdhl
+logstash.conf:103:      user => admin
+logstash.conf:104:      password => ksdjhfskjdhl
+logstash.conf:113:      user => admin
+logstash.conf:114:      password => ksdjhfskjdhl
+logstash.conf:123:      user => admin
+logstash.conf:124:      password => ksdjhfskjdhl
+logstash.conf:133:      user => admin
+logstash.conf:134:      password => ksdjhfskjdhl
+logstash.conf:143:      user => admin
+logstash.conf:144:      password => ksdjhfskjdhl
+logstash.conf:153:      user => admin
+logstash.conf:154:      password => ksdjhfskjdhl
+logstash.conf:163:      user => admin
+logstash.conf:164:      password => ksdjhfskjdhl
+logstash.conf:173:      user => admin
+logstash.conf:174:      password => ksdjhfskjdhl
+logstash.conf:183:      user => admin
+logstash.conf:184:      password => ksdjhfskjdhl
+logstash.conf:193:      user => admin
+logstash.conf:194:      password => ksdjhfskjdhl
+logstash.conf:203:      user => admin
+logstash.conf:204:      password => ksdjhfskjdhl
+logstash.conf:213:      user => admin
+logstash.conf:214:      password => ksdjhfskjdhl
+logstash.conf:223:      user => admin
+logstash.conf:224:      password => ksdjhfskjdhl
+readme.md:3:Please change password to logstash and kibana...
+root@prod-oes-elk01:/home/xxujd/elasticsearch_opendistro#
