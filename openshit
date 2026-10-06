@@ -1,61 +1,59 @@
-That explains it. The admin DN is the demo kirk cert (CN=kirk,OU=client,O=client,L=test, C=de), but nobody mounted kirk.pem into the container. The ls on the host failed because that path only exists inside the container. On the host, the files are in /home/xxujd/elasticsearch_opendistro/.
-
-1. Check the host directory first
-bash
-ls -l /home/xxujd/elasticsearch_opendistro/
-
-If kirk.pem and kirk-key.pem are there, copy them into the container and skip to step 3. While you're there, look for a docker-compose.yml or other files. The admin password might be sitting in plain text in one of them.
-
-bash
-docker cp /home/xxujd/elasticsearch_opendistro/kirk.pem opensearch-node1:/tmp/
-docker cp /home/xxujd/elasticsearch_opendistro/kirk-key.pem opensearch-node1:/tmp/
-2. If they're not there, extract the demo kirk cert
-
-esnode.pem, root-ca.pem and allow_unsafe_democertificates: true strongly suggest these are the stock demo certs. Confirm that on the host:
-
-bash
-openssl x509 -in /home/xxujd/elasticsearch_opendistro/root-ca.pem -noout -subject
-
-If the subject mentions Example Com Inc. Root CA, it's the demo CA. The matching kirk cert and key are embedded in the demo install script that ships in the image. Extract them inside the container:
-
-bash
-docker exec -it opensearch-node1 bash
-cd /usr/share/opensearch/plugins/opensearch-security/tools
-
-extract() {
-  awk -v want="/$1\"" '
-    /-----BEGIN/ {buf=""; cap=1}
-    cap {l=$0; sub(/^echo "/,"",l); sub(/".*$/,"",l); buf=buf l "\n"}
-    /-----END/ {cap=0}
-    index($0, want) {printf "%s", buf}
-  ' install_demo_configuration.sh > /tmp/$1
-}
-extract kirk.pem
-extract kirk-key.pem
-
-Before using them, verify the subject matches admin_dn, the issuer matches the root CA, and the two hashes are identical (meaning the key matches the cert):
-
-bash
-openssl x509 -in /tmp/kirk.pem -noout -subject -issuer
-openssl x509 -in /tmp/kirk.pem -noout -modulus | md5sum
-openssl rsa  -in /tmp/kirk-key.pem -noout -modulus | md5sum
-
-If the files come out empty, run grep -n kirk install_demo_configuration.sh and copy the blocks by hand.
-
-3. Back up, edit, upload
-bash
-export JAVA_HOME=/usr/share/opensearch/jdk
-cd /usr/share/opensearch/plugins/opensearch-security/tools
-CFG=/usr/share/opensearch/config
-ADM="-icl -nhnv -cacert $CFG/root-ca.pem -cert /tmp/kirk.pem -key /tmp/kirk-key.pem"
-
-./securityadmin.sh -backup /tmp/secbackup $ADM
-./hash.sh -p 'the-real-new-password'
-# replace admin's hash in /tmp/secbackup/internal_users.yml
-./securityadmin.sh -f /tmp/secbackup/internal_users.yml -t internalusers $ADM
-
-Afterwards, copy the edited file over /home/xxujd/elasticsearch_opendistro/internal_users.yml on the host. That keeps the mounted file in line with what's live, so a future re-init doesn't bring the old (or unknown) password back.
-
-Worth flagging
-
-This is a prod box running the public demo certs, and port 9300 is published on 0.0.0.0. Anyone who can reach that port can do exactly what you're doing now with a publicly available cert, so this is effectively an unauthenticated admin backdoor. At minimum, firewall 9300 (nothing outside the cluster needs it). Replacing the demo PKI is worth putting on the list, along with the 1.2.x upgrade.
+root@prod-oes-elk01:/home/rundeck# ls -l /home/xxujd/elasticsearch_opendistro/
+total 96
+-rw-rw-r-- 1 xxujd xxujd   49 Mar  8  2022 action_groups.yml
+-rw-rw-r-- 1 xxujd xxujd 2573 Jul  1  2022 config.yml
+-rw-rw-r-- 1 xxujd xxujd 1180 May 22  2024 custom-opensearch_dashboards.yml
+-rw-r--r-- 1 root  root  4316 Aug 31 08:23 docker-compose.yml
+-rw-r--r-- 1 root  root  3917 Jun 11  2024 docker-compose.yml_
+drwxr-xr-x 4 xxujd xxujd 4096 Nov 25  2022 elk-cert
+drwxr-xr-x 4 xxujd xxujd 4096 Apr 14  2022 elk-cert_
+-rw-r--r-- 1 xxujd xxujd 1705 Jun 11  2024 esnode-key.pem
+-rw-rw-rw- 1 xxujd xxujd 1721 Jun 11  2024 esnode.pem
+-rw-rw-r-- 1 xxujd xxujd 1324 Mar  9  2022 internal_users.yml
+-rw-r--rw- 1 xxujd xxujd  107 Oct  4  2024 java.security
+-rw-r--r-- 1 xxujd xxujd 6597 Feb 21  2025 logstash.conf
+-rw-r--r-- 1 root  root  6598 Jan 20  2025 logstash.conf_
+-rw-rw-rw- 1 xxujd xxujd 2512 Aug 31 07:47 opensearch.yml
+-rw-rw-r-- 1 xxujd xxujd  335 Mar  8  2022 readme.md
+-rw-rw-r-- 1 xxujd xxujd  972 Jun 28  2022 roles_mapping.yml
+-rw-rw-r-- 1 xxujd xxujd 5921 Mar  8  2022 roles.yml
+-rw-r--r-- 1 xxujd xxujd 1445 Jun 11  2024 root-ca.pem
+-rw-rw-r-- 1 xxujd xxujd   64 Mar  8  2022 run.sh
+-rw-rw-r-- 1 xxujd xxujd  170 Mar  8  2022 tenants.yml
+root@prod-oes-elk01:/home/rundeck# docker cp /home/xxujd/elasticsearch_opendistro/kirk.pem opensearch-node1:/tmp/
+lstat /home/xxujd/elasticsearch_opendistro/kirk.pem: no such file or directory
+root@prod-oes-elk01:/home/rundeck# docker cp /home/xxujd/elasticsearch_opendistro/kirk-key.pem opensearch-node1:/tmp/
+lstat /home/xxujd/elasticsearch_opendistro/kirk-key.pem: no such file or directory
+root@prod-oes-elk01:/home/rundeck# openssl x509 -in /home/xxujd/elasticsearch_opendistro/root-ca.pem -noout -subject
+subject=DC = com, DC = example, O = Example Com Inc., OU = Example Com Inc. Root CA, CN = Example Com Inc. Root CA
+root@prod-oes-elk01:/home/rundeck# docker exec -it opensearch-node1 bash
+[opensearch@bbb94e0fa43f ~]$ cd /usr/share/opensearch/plugins/opensearch-security/tools
+[opensearch@bbb94e0fa43f tools]$ extract() {
+>   awk -v want="/$1\"" '
+>     /-----BEGIN/ {buf=""; cap=1}
+>     cap {l=$0; sub(/^echo "/,"",l); sub(/".*$/,"",l); buf=buf l "\n"}
+>     /-----END/ {cap=0}
+>     index($0, want) {printf "%s", buf}
+>   ' install_demo_configuration.sh > /tmp/$1
+> }
+[opensearch@bbb94e0fa43f tools]$ extract kirk.pem
+[opensearch@bbb94e0fa43f tools]$ extract kirk-key.pem
+[opensearch@bbb94e0fa43f tools]$ extract() {
+>   awk -v want="/$1\"" '
+>     /-----BEGIN/ {buf=""; cap=1}
+>     cap {l=$0; sub(/^echo "/,"",l); sub(/".*$/,"",l); buf=buf l "\n"}
+>     /-----END/ {cap=0}
+>     index($0, want) {printf "%s", buf}
+>   ' install_demo_configuration.sh > /tmp/$1
+> }
+[opensearch@bbb94e0fa43f tools]$ extract kirk.pem
+[opensearch@bbb94e0fa43f tools]$ extract kirk-key.pem
+[opensearch@bbb94e0fa43f tools]$ openssl x509 -in /tmp/kirk.pem -noout -subject -issuer
+bash: openssl: command not found
+[opensearch@bbb94e0fa43f tools]$ openssl x509 -in /tmp/kirk.pem -noout -modulus | md5sum
+bash: openssl: command not found
+d41d8cd98f00b204e9800998ecf8427e  -
+[opensearch@bbb94e0fa43f tools]$ openssl rsa  -in /tmp/kirk-key.pem -noout -modulus | md5sum
+bash: openssl: command not found
+d41d8cd98f00b204e9800998ecf8427e  -
+[opensearch@bbb94e0fa43f tools]$
