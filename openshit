@@ -1,13 +1,50 @@
-docker exec -it opensearch-node1 bash
-
-export JAVA_HOME=/usr/share/opensearch/jdk
-cd /usr/share/opensearch/plugins/opensearch-security/tools
-chmod +x *.sh
-CFG=/usr/share/opensearch/config
-
-# Back up the current security config (all users with their existing hashes)
-./securityadmin.sh -backup /tmp/secbackup -icl -nhnv \
-  -cacert $CFG/root-ca.pem -cert $CFG/kirk.pem -key $CFG/kirk-key.pem
-
-# Generate a hash for the new password
 ./hash.sh -p 'YourNewStrongPassword'
+[opensearch@bbb94e0fa43f ~]$
+[opensearch@bbb94e0fa43f ~]$ export JAVA_HOME=/usr/share/opensearch/jdk
+[opensearch@bbb94e0fa43f ~]$ cd /usr/share/opensearch/plugins/opensearch-security/tools
+[opensearch@bbb94e0fa43f tools]$ chmod +x *.sh
+[opensearch@bbb94e0fa43f tools]$ CFG=/usr/share/opensearch/config
+[opensearch@bbb94e0fa43f tools]$
+[opensearch@bbb94e0fa43f tools]$ # Back up the current security config (all users with their existing hashes)
+[opensearch@bbb94e0fa43f tools]$ ./securityadmin.sh -backup /tmp/secbackup -icl -nhnv \
+>   -cacert $CFG/root-ca.pem -cert $CFG/kirk.pem -key $CFG/kirk-key.pem
+Security Admin v7
+Will connect to localhost:9300 ... done
+ERR: An unexpected IllegalStateException occured: failed to load plugin class [org.opensearch.security.OpenSearchSecurityPlugin]
+Trace:
+java.lang.IllegalStateException: failed to load plugin class [org.opensearch.security.OpenSearchSecurityPlugin]
+        at org.opensearch.plugins.PluginsService.loadPlugin(PluginsService.java:790)
+        at org.opensearch.plugins.PluginsService.<init>(PluginsService.java:141)
+        at org.opensearch.client.transport.TransportClient.newPluginService(TransportClient.java:139)
+        at org.opensearch.client.transport.TransportClient.buildTemplate(TransportClient.java:172)
+        at org.opensearch.client.transport.TransportClient.<init>(TransportClient.java:368)
+        at org.opensearch.security.tools.SecurityAdmin$TransportClientImpl.<init>(SecurityAdmin.java:1007)
+        at org.opensearch.security.tools.SecurityAdmin.execute(SecurityAdmin.java:520)
+        at org.opensearch.security.tools.SecurityAdmin.main(SecurityAdmin.java:157)
+Caused by: java.lang.reflect.InvocationTargetException
+        at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+        at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:64)
+        at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+        at java.base/java.lang.reflect.Constructor.newInstanceWithCaller(Constructor.java:500)
+        at java.base/java.lang.reflect.Constructor.newInstance(Constructor.java:481)
+        at org.opensearch.plugins.PluginsService.loadPlugin(PluginsService.java:781)
+        ... 7 more
+Caused by: OpenSearchSecurityException[Error while initializing transport SSL layer from PEM: OpenSearchException[Unable to read /usr/share/opensearch/config/kirk.pem (/usr/share/opensearch/config/kirk.pem). Please make sure this files exists and is readable regarding to permissions. Property: plugins.security.ssl.transport.pemcert_filepath]]; nested: OpenSearchException[Unable to read /usr/share/opensearch/config/kirk.pem (/usr/share/opensearch/config/kirk.pem). Please make sure this files exists and is readable regarding to permissions. Property: plugins.security.ssl.transport.pemcert_filepath];
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.initTransportSSLConfig(DefaultSecurityKeyStore.java:419)
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.initSSLConfig(DefaultSecurityKeyStore.java:258)
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.<init>(DefaultSecurityKeyStore.java:179)
+        at org.opensearch.security.ssl.OpenSearchSecuritySSLPlugin.<init>(OpenSearchSecuritySSLPlugin.java:218)
+        at org.opensearch.security.OpenSearchSecurityPlugin.<init>(OpenSearchSecurityPlugin.java:252)
+        ... 13 more
+Caused by: OpenSearchException[Unable to read /usr/share/opensearch/config/kirk.pem (/usr/share/opensearch/config/kirk.pem). Please make sure this files exists and is readable regarding to permissions. Property: plugins.security.ssl.transport.pemcert_filepath]
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.checkPath(DefaultSecurityKeyStore.java:952)
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.resolve(DefaultSecurityKeyStore.java:237)
+        at org.opensearch.security.ssl.DefaultSecurityKeyStore.initTransportSSLConfig(DefaultSecurityKeyStore.java:396)
+        ... 17 more
+
+
+[opensearch@bbb94e0fa43f tools]$
+[opensearch@bbb94e0fa43f tools]$ # Generate a hash for the new password
+[opensearch@bbb94e0fa43f tools]$ ./hash.sh -p 'YourNewStrongPassword'
+$2y$12$Tk5RWXO9xtrPS/UOJThVA.B28fLURNSiZbTo1PwZFSZxFDd1E0thm
+[opensearch@bbb94e0fa43f tools]$
