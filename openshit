@@ -1,18 +1,31 @@
-docker inspect opensearch-node1 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}' | grep -i 'config\|\.yml'
-
-docker inspect opensearch-node2 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
-
-docker inspect opensearch-node2 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+----- security-auditlog-2022.03.14 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
 
 
-cd /home/xxujd/elasticsearch_opendistro
-tail -5 opensearch.yml          # make sure the last line isn't indented
-cp -n opensearch.yml opensearch.yml.bak
-cat >> opensearch.yml <<'EOF'
+----- security-auditlog-2022.03.15 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
 
-reindex.remote.whitelist: "10.50.119.4:9200"
-reindex.ssl.verification_mode: none
-EOF
-docker restart opensearch-node1 opensearch-node2
-sleep 20
-curl -sk -u admin:ksdjhfskjdhl https://localhost:9200/_cluster/health?pretty
+
+----- security-auditlog-2022.03.16 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
+
+
+----- security-auditlog-2022.03.17 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
+
+
+----- security-auditlog-2022.03.18 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
+
+
+----- security-auditlog-2022.03.19 -----
+  did not start:
+{"error":{"root_cause":[{"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"}],"type":"action_request_validation_exception","reason":"Validation Failed: 1: reindex from remote sources doesn't support slices > 1 but was [0];"},"status":400}
+
+
+----- security-auditlog-2022.03.20 -----
