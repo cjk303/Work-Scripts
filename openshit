@@ -1,139 +1,34 @@
-#!/usr/bin/env bash
-#
-# opensearch-sync.sh — pull indices from a READ-ONLY source OpenSearch into
-# THIS (local/clone) cluster, via native remote reindex.
-#
-# The source is only ever read: health checks, settings/mappings reads, and the
-# reindex scroll. Every write goes to the LOCAL cluster. The source is never
-# modified in any way.
-#
-# PREREQUISITE (on THIS clone only, one time) in opensearch.yml, then restart:
-#     reindex.remote.whitelist: "SOURCE_IP:9200"
-#     reindex.ssl.verification_mode: none        # demo cert SAN won't match IP
-#
-# Run on the clone:
-#     ./opensearch-sync.sh
-#
-set -uo pipefail
+  File "<string>", line 4, in <module>
+    s=d.get("settings",{}).get("index",{})
+      ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+create 200
+  task U9WNutS_SZ2eoe8yySry2g:33481  (cancel with: curl -k -u admin:*** -XPOST https://localhost:9200/_tasks/U9WNutS_SZ2eoe8yySry2g:33481/_cancel)
 
-LOCAL="https://localhost:9200"
-BATCH=1000          # docs per scroll batch (keep modest to be gentle on source)
+    done: created=? updated=? took=?ms failures=0
+  verify: source=14685241  local=0
 
-have(){ command -v "$1" >/dev/null 2>&1; }
-have python3 || { echo "python3 required"; exit 1; }
-hr(){ printf '\n----- %s -----\n' "$1"; }
+----- SYNC  gladsaxe-2026.09 -----
+drop 200
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    s=d.get("settings",{}).get("index",{})
+      ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+create 200
+  task U9WNutS_SZ2eoe8yySry2g:33618  (cancel with: curl -k -u admin:*** -XPOST https://localhost:9200/_tasks/U9WNutS_SZ2eoe8yySry2g:33618/_cancel)
 
-# ---- prompts ---------------------------------------------------------------
-read -r -p "Source host/IP: "                SRC_HOST
-read -r -p "Source port [9200]: "            SRC_PORT;  SRC_PORT=${SRC_PORT:-9200}
-read -r -p "Source read user [admin]: "      SRC_USER;  SRC_USER=${SRC_USER:-admin}
-read -r -s -p "Source password: "            SRC_PASS;  echo
-read -r -s -p "Local (clone) admin password: " LOC_PASS; echo
-read -r -p "Index pattern to sync [*]: "     PAT;       PAT=${PAT:-*}
-echo "Mode:  [r]eplace = drop local index then copy (exact mirror, no dupes)"
-echo "       [m]erge   = reindex in place (overwrites docs with same _id)"
-read -r -p "Mode [r]: " MODE; MODE=${MODE:-r}
-read -r -p "Throttle requests/sec (-1 = unlimited) [1000]: " RPS; RPS=${RPS:-1000}
+    done: created=? updated=? took=?ms failures=0
+  verify: source=15770823  local=0
 
-SRC="https://${SRC_HOST}:${SRC_PORT}"
-SRC_AUTH="${SRC_USER}:${SRC_PASS}"
-LOC_AUTH="admin:${LOC_PASS}"
+----- SYNC  gladsaxe-2026.10 -----
+drop 200
+Traceback (most recent call last):
+  File "<string>", line 4, in <module>
+    s=d.get("settings",{}).get("index",{})
+      ^^^^^
+AttributeError: 'str' object has no attribute 'get'
+create 200
+^C  task U9WNutS_SZ2eoe8yySry2g:33735  (cancel with: curl -k -u admin:*** -XPOST https://localhost:9200/_tasks/U9WNutS_SZ2eoe8yySry2g:33735/_cancel)
 
-cs(){ curl -sk -u "$SRC_AUTH" -H 'Content-Type: application/json' "$SRC/$1" "${@:2}"; }   # source: READ ONLY
-cl(){ curl -sk -u "$LOC_AUTH" -H 'Content-Type: application/json' "$LOCAL/$1" "${@:2}"; } # local
-jget(){ python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
-
-# ---- connectivity ----------------------------------------------------------
-hr "CONNECTIVITY"
-sc=$(cs '' -o /dev/null -w '%{http_code}'); echo "source $SRC -> HTTP ${sc:-none}"
-lc=$(cl '' -o /dev/null -w '%{http_code}'); echo "local  $LOCAL -> HTTP ${lc:-none}"
-[ "$sc" = "200" ] && [ "$lc" = "200" ] || { echo "Both must return 200. Check hosts/passwords."; exit 1; }
-
-# ---- plan ------------------------------------------------------------------
-hr "SOURCE INDICES MATCHING '$PAT'"
-mapfile -t IDX < <(cs "_cat/indices/${PAT}?h=index" | grep -v '^\.' | sort)
-[ "${#IDX[@]}" -gt 0 ] || { echo "No non-system indices match '$PAT'."; exit 1; }
-
-printf '%-45s %14s %12s   %s\n' "index" "source docs" "size" "local now"
-for i in "${IDX[@]}"; do
-  sd=$(cs "$i/_count" | jget "['count']"); sz=$(cs "_cat/indices/$i?h=store.size" | tr -d ' ')
-  if cl "$i" -o /dev/null -w '%{http_code}' | grep -q 200; then
-    ld=$(cl "$i/_count" | jget "['count']")
-  else ld="(absent)"; fi
-  printf '%-45s %14s %12s   %s\n' "$i" "${sd:-?}" "${sz:-?}" "${ld:-?}"
-done
-
-MODE_NAME=$([ "$MODE" = r ] && echo "REPLACE (drop+copy)" || echo "MERGE (in place)")
-echo; echo "Mode: $MODE_NAME   Throttle: $RPS req/s   Batch: $BATCH"
-read -r -p "Proceed? [y/N]: " ok; [ "$ok" = y ] || { echo "Aborted."; exit 0; }
-
-# ---- per-index copy --------------------------------------------------------
-copy_mapping(){ # recreate local index with source settings+mappings (minus volatile keys)
-  local i="$1"
-  cs "$i/_settings,_mappings" | python3 -c '
-import sys,json
-d=list(json.load(sys.stdin).values())[0]
-s=d.get("settings",{}).get("index",{})
-for k in ("uuid","creation_date","version","provided_name","resize",
-          "routing","blocks","frozen","verified_before_close","history"):
-    s.pop(k,None)
-print(json.dumps({"settings":{"index":s},"mappings":d.get("mappings",{})}))' \
-  | { read -r body; cl "$i" -XPUT -d "$body" -o /dev/null -w 'create %{http_code}\n'; }
-}
-
-poll(){ # poll a reindex task to completion, printing progress
-  local tid="$1"
-  while :; do
-    local r; r=$(cl "_tasks/${tid}")
-    local done; done=$(echo "$r" | jget "['completed']")
-    local created total; created=$(echo "$r" | jget "['task']['status']['created']")
-    total=$(echo "$r" | jget "['task']['status']['total']")
-    if [ -n "${total:-}" ] && [ "${total:-0}" -gt 0 ] 2>/dev/null; then
-      printf '\r    %s / %s docs' "${created:-0}" "$total"
-    fi
-    if [ "$done" = "True" ]; then
-      echo
-      echo "$r" | python3 -c 'import sys,json
-r=json.load(sys.stdin).get("response",{})
-f=r.get("failures",[])
-print("    done: created=%s updated=%s took=%sms failures=%d"%(
-  r.get("created","?"),r.get("updated","?"),r.get("took","?"),len(f)))
-[print("      FAIL:",json.dumps(x)[:200]) for x in f[:5]]'
-      break
-    fi
-    sleep 5
-  done
-}
-
-for i in "${IDX[@]}"; do
-  hr "SYNC  $i"
-  if [ "$MODE" = r ]; then
-    cl "$i" -XDELETE -o /dev/null -w 'drop %{http_code}\n'   # clone-side only; 404 if absent is fine
-    copy_mapping "$i"
-  else
-    cl "$i" -o /dev/null -w '%{http_code}' | grep -q 200 || copy_mapping "$i"
-  fi
-
-  body=$(cat <<JSON
-{ "source": { "remote": { "host": "$SRC", "username": "$SRC_USER", "password": "$SRC_PASS",
-      "socket_timeout": "5m", "connect_timeout": "30s" }, "index": "$i", "size": $BATCH },
-  "dest": { "index": "$i" } }
-JSON
-)
-  resp=$(cl "_reindex?wait_for_completion=false&requests_per_second=${RPS}" -XPOST -d "$body")
-  tid=$(echo "$resp" | jget "['task']")
-  if [ -z "${tid:-}" ]; then
-    echo "  reindex did not start:"; echo "$resp" | head -c 600; echo
-    echo "$resp" | grep -qi 'whitelist' && echo "  -> add this host to reindex.remote.whitelist on the clone and restart."
-    echo "$resp" | grep -qiE 'ssl|certificate|handshake' && echo "  -> set reindex.ssl.verification_mode: none on the clone and restart."
-    continue
-  fi
-  echo "  task $tid  (cancel with: curl -k -u admin:*** -XPOST $LOCAL/_tasks/$tid/_cancel)"
-  poll "$tid"
-  cl "$i/_refresh" -o /dev/null
-  echo "  verify: source=$(cs "$i/_count" | jget "['count']")  local=$(cl "$i/_count" | jget "['count']")"
-done
-
-hr "DONE"
-echo "Re-run any time to catch up. In replace mode each index is rebuilt exactly;"
-echo "in merge mode docs with stable _ids are overwritten (auto-id indices may duplicate)."
+    done: created=? updated=? took=?ms failures=0
