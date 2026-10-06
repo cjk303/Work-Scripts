@@ -1,192 +1,26 @@
-#!/usr/bin/env bash
-#
-# opensearch-import-week.sh — safely import the last N days of records from a
-# READ-ONLY source OpenSearch into THIS cluster. Built to be re-run freely.
-#
-# SAFE BY DESIGN:
-#   * same-host guard  — aborts if the source resolves to this machine
-#   * preflight        — copies 1 doc first; refuses to go further if it fails
-#   * prereq helper    — if the preflight fails on whitelist/SSL, offers to add
-#                        the two opensearch.yml lines and restart the nodes,
-#                        but only after showing the target file + a y/N confirm
-#   * never drops      — only adds/overwrites; your existing data is untouched
-#   * idempotent       — reindex preserves the source _id, so re-running
-#                        overwrites matching docs instead of duplicating them
-#   * windowed         — only docs with @timestamp within the last N days
-#   * read-only source — source gets GETs and the reindex scroll, nothing else
-#
-set -uo pipefail
-have(){ command -v "$1" >/dev/null 2>&1; }
-have python3 || { echo "python3 required"; exit 1; }
-hr(){ printf '\n----- %s -----\n' "$1"; }
+Source port [9200]:
+Source read user [admin]:
+Source password:
+Local admin password:
+Index pattern [*]:
+Timestamp field [@timestamp]:
+Import last how many days [7]: 5
+Throttle req/s (-1 = unlimited) [2000]:
+Scroll batch size [2000]:
 
-LOCAL="https://localhost:9200"
-echo "host: $(hostname)"
+----- CONNECTIVITY -----
+source https://10.50.119.4:9200 -> HTTP 200   local -> HTTP 200
 
-# ---- prompts ---------------------------------------------------------------
-read -r -p "Source host/IP: "                  SRC_HOST
-read -r -p "Source port [9200]: "              SRC_PORT; SRC_PORT=${SRC_PORT:-9200}
-read -r -p "Source read user [admin]: "        SRC_USER; SRC_USER=${SRC_USER:-admin}
-read -r -s -p "Source password: "              SRC_PASS; echo
-read -r -s -p "Local admin password: "         LOC_PASS; echo
-read -r -p "Index pattern [*]: "                PAT;  PAT=${PAT:-*}
-read -r -p "Timestamp field [@timestamp]: "     TS;   TS=${TS:-@timestamp}
-read -r -p "Import last how many days [7]: "     DAYS; DAYS=${DAYS:-7}
-read -r -p "Throttle req/s (-1 = unlimited) [2000]: " RPS; RPS=${RPS:-2000}
-read -r -p "Scroll batch size [2000]: "          BATCH; BATCH=${BATCH:-2000}
+----- PREFLIGHT (copy 1 doc to prove the link works) -----
+Preflight blocked by a remote-reindex prerequisite:
+{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"}],"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"},"status":400}
 
-SRC="https://${SRC_HOST}:${SRC_PORT}"
-export SRC SRC_USER SRC_PASS TS DAYS BATCH
-cs(){ curl -sk -u "${SRC_USER}:${SRC_PASS}" -H 'Content-Type: application/json' "$SRC/$1" "${@:2}"; }
-cl(){ curl -sk -u "admin:${LOC_PASS}"       -H 'Content-Type: application/json' "$LOCAL/$1" "${@:2}"; }
-jget(){ python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
-
-# ---- same-host guard -------------------------------------------------------
-case "$SRC_HOST" in
-  localhost|127.*|::1) echo "ABORT: source is loopback — that is THIS machine."; exit 1;;
-esac
-sip=$(getent hosts "$SRC_HOST" 2>/dev/null | awk '{print $1; exit}'); [ -z "$sip" ] && sip="$SRC_HOST"
-for ip in $(hostname -I 2>/dev/null); do
-  [ "$ip" = "$sip" ] && { echo "ABORT: source ($SRC_HOST -> $sip) is THIS machine. Run on the clone, source = the OTHER box."; exit 1; }
-done
-
-WINQ=$(python3 -c 'import os,json;print(json.dumps({"range":{os.environ["TS"]:{"gte":"now-%sd"%os.environ["DAYS"]}}}))')
-
-# ---- connectivity ----------------------------------------------------------
-hr "CONNECTIVITY"
-sc=$(cs '' -o /dev/null -w '%{http_code}'); lc=$(cl '' -o /dev/null -w '%{http_code}')
-echo "source $SRC -> HTTP ${sc:-none}   local -> HTTP ${lc:-none}"
-[ "$sc" = 200 ] && [ "$lc" = 200 ] || { echo "Both must be 200."; exit 1; }
-
-mapfile -t IDX < <(cs "_cat/indices/${PAT}?h=index" | grep -v '^\.' | sort)
-[ "${#IDX[@]}" -gt 0 ] || { echo "No non-system indices match '$PAT'."; exit 1; }
-
-# ---- preflight + prereq helper ---------------------------------------------
-PF=""   # holds the last preflight response body
-do_preflight(){
-  PF=$(cl "_reindex" -XPOST -d "{\"max_docs\":1,
-    \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"$SRC_USER\",\"password\":\"$SRC_PASS\"},
-      \"index\":\"${IDX[0]}\",\"size\":1},\"dest\":{\"index\":\"zz-weektest\"}}")
-  local created; created=$(echo "$PF" | jget "['created']")
-  cl "zz-weektest" -XDELETE -o /dev/null
-  [ "${created:-0}" = "1" ]
-}
-
-fix_prereqs(){
-  have docker || { echo "docker not available here — add the lines manually and restart."; return 1; }
-  # find the two OpenSearch node containers by image
-  local NODES; NODES=$(docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
-    | awk -F'\t' '$2 ~ /opensearchproject\/opensearch:/{print $1}')
-  [ -n "$NODES" ] || { echo "no running opensearch node containers found."; return 1; }
-  local N1; N1=$(echo "$NODES" | head -1)
-  # resolve the host path of opensearch.yml actually mounted into that node
-  local YML; YML=$(docker inspect "$N1" --format \
-    '{{range .Mounts}}{{if eq .Destination "/usr/share/opensearch/config/opensearch.yml"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
-  [ -n "$YML" ] && [ -f "$YML" ] || { echo "could not locate opensearch.yml on disk for $N1."; return 1; }
-
-  # which lines are missing
-  local need_wl=1 need_ssl=1
-  grep -qE '^[[:space:]]*reindex\.remote\.whitelist'       "$YML" && need_wl=0
-  grep -qE '^[[:space:]]*reindex\.ssl\.verification_mode'  "$YML" && need_ssl=0
-  if [ "$need_wl" = 0 ] && ! grep -q "${SRC_HOST}:${SRC_PORT}" "$YML"; then
-    echo "A reindex.remote.whitelist line already exists but does not include ${SRC_HOST}:${SRC_PORT}."
-    echo "Merge it by hand (it's a comma-separated list) — not auto-editing to avoid clobbering it."
-    return 1
-  fi
-  [ "$need_wl" = 0 ] && [ "$need_ssl" = 0 ] && { echo "both settings already present; restart may be all that's needed."; }
-
-  # refuse to append if the file ends inside an indented block (would corrupt YAML)
-  local last; last=$(grep -vE '^[[:space:]]*$' "$YML" | tail -1)
-  if [[ "$last" =~ ^[[:space:]] ]]; then
-    echo "opensearch.yml ends inside an indented block; appending is unsafe."
-    echo "Add these lines manually (top-level, no indentation), then restart $NODES:"
-    [ "$need_wl"  = 1 ] && echo "  reindex.remote.whitelist: \"${SRC_HOST}:${SRC_PORT}\""
-    [ "$need_ssl" = 1 ] && echo "  reindex.ssl.verification_mode: none"
-    return 1
-  fi
-
-  echo
-  echo "About to modify remote-reindex prerequisites ON THIS HOST ($(hostname)):"
-  echo "  file:       $YML"
-  echo "  backup:     ${YML}.bak"
-  echo "  add lines:"
-  [ "$need_wl"  = 1 ] && echo "      reindex.remote.whitelist: \"${SRC_HOST}:${SRC_PORT}\""
-  [ "$need_ssl" = 1 ] && echo "      reindex.ssl.verification_mode: none"
-  echo "  then restart: $NODES  (brief cluster blip)"
-  read -r -p "Proceed? [y/N]: " go; [ "$go" = y ] || { echo "Skipped — no changes made."; return 1; }
-
-  cp -n "$YML" "${YML}.bak"
-  {
-    echo ""
-    [ "$need_wl"  = 1 ] && echo "reindex.remote.whitelist: \"${SRC_HOST}:${SRC_PORT}\""
-    [ "$need_ssl" = 1 ] && echo "reindex.ssl.verification_mode: none"
-  } >> "$YML"
-  echo "updated $YML"
-
-  echo "restarting nodes: $NODES"
-  docker restart $NODES >/dev/null
-  printf "waiting for cluster"
-  for _ in $(seq 1 40); do
-    s=$(cl '_cluster/health' | jget "['status']")
-    [ -n "${s:-}" ] && { echo " -> $s"; break; }
-    printf '.'; sleep 2
-  done
-  return 0
-}
-
-hr "PREFLIGHT (copy 1 doc to prove the link works)"
-if do_preflight; then
-  echo "preflight OK (1 doc copied and removed)"
-else
-  if echo "$PF" | grep -qiE 'whitelist|ssl|cert|handshake'; then
-    echo "Preflight blocked by a remote-reindex prerequisite:"
-    echo "$PF" | head -c 300; echo
-    fix_prereqs || { echo "Prereq not resolved. Fix opensearch.yml + restart, then re-run."; exit 1; }
-    hr "PREFLIGHT (retry)"
-    do_preflight && echo "preflight OK (1 doc copied and removed)" \
-      || { echo "Still failing:"; echo "$PF" | head -c 400; echo; exit 1; }
-  else
-    echo "Preflight failed (not a prereq issue):"; echo "$PF" | head -c 600; echo; exit 1
-  fi
-fi
-
-# ---- plan ------------------------------------------------------------------
-hr "PLAN: import last ${DAYS}d  |  ${RPS} req/s  |  slices=auto  (no drops)"
-printf '%-45s %14s %14s\n' "index" "src this wk" "local this wk"
-for i in "${IDX[@]}"; do
-  sd=$(cs "$i/_count" -d "{\"query\":$WINQ}" | jget "['count']")
-  ld=$(cl "$i" -o /dev/null -w '%{http_code}' | grep -q 200 && cl "$i/_count" -d "{\"query\":$WINQ}" | jget "['count']" || echo 0)
-  printf '%-45s %14s %14s\n' "$i" "${sd:-?}" "${ld:-0}"
-done
-read -r -p "Proceed? [y/N]: " ok; [ "$ok" = y ] || { echo "Aborted."; exit 0; }
-
-# ---- import ----------------------------------------------------------------
-for i in "${IDX[@]}"; do
-  hr "$i"
-  body=$(Q="$WINQ" IDX="$i" python3 -c '
-import os,json
-print(json.dumps({"source":{"remote":{"host":os.environ["SRC"],"username":os.environ["SRC_USER"],
-  "password":os.environ["SRC_PASS"],"socket_timeout":"5m","connect_timeout":"30s"},
-  "index":os.environ["IDX"],"size":int(os.environ["BATCH"]),"query":json.loads(os.environ["Q"])},
-  "dest":{"index":os.environ["IDX"]}}))')
-  resp=$(cl "_reindex?wait_for_completion=false&requests_per_second=${RPS}&slices=auto" -XPOST -d "$body")
-  tid=$(echo "$resp" | jget "['task']")
-  if [ -z "${tid:-}" ]; then echo "  did not start:"; echo "$resp" | head -c 400; echo; continue; fi
-  echo "  task $tid"
-  while :; do
-    r=$(cl "_tasks/${tid}"); done=$(echo "$r" | jget "['completed']")
-    cr=$(echo "$r" | jget "['task']['status']['created']"); tot=$(echo "$r" | jget "['task']['status']['total']")
-    [ "${tot:-0}" -gt 0 ] 2>/dev/null && printf '\r    %s / %s docs' "${cr:-0}" "$tot"
-    if [ "$done" = "True" ]; then echo
-      echo "$r" | python3 -c 'import sys,json
-d=json.load(sys.stdin);r=d.get("response",{});st=d.get("task",{}).get("status",{})
-print("    created=%s updated=%s failures=%d"%(r.get("created",st.get("created","?")),
-  r.get("updated",st.get("updated","?")),len(r.get("failures",[]))))'
-      break; fi
-    sleep 5
-  done
-  cl "$i/_refresh" -o /dev/null
-  echo "  verify this week: source=$(cs "$i/_count" -d "{\"query\":$WINQ}" | jget "['count']")  local=$(cl "$i/_count" -d "{\"query\":$WINQ}" | jget "['count']")"
-done
-hr "DONE"
-echo "Safe to re-run: it overwrites matching _ids and adds new docs, no duplicates."
+could not locate opensearch.yml on disk for opensearch-node2.
+Prereq not resolved. Fix opensearch.yml + restart, then re-run.
+root@prod-oes-elk01-clone:~# docker ps -a
+CONTAINER ID   IMAGE                                            COMMAND                  CREATED       STATUS          PORTS                                                                                                                                             NAMES
+44390d5dc3d7   docker.elastic.co/logstash/logstash-oss:7.12.1   "/usr/local/bin/dock…"   5 weeks ago   Up 20 minutes   0.0.0.0:5011-5013->5011-5013/tcp, [::]:5011-5013->5011-5013/tcp, 0.0.0.0:5044->5044/tcp, [::]:5044->5044/tcp, 9600/tcp                            logstash
+9f9420e787bb   opensearchproject/opensearch-dashboards:1.2.0    "./opensearch-dashbo…"   5 weeks ago   Up 20 minutes   0.0.0.0:5601->5601/tcp, [::]:5601->5601/tcp                                                                                                       opensearch-dashboards
+3720a53f3849   opensearchproject/opensearch:1.2.3               "./opensearch-docker…"   5 weeks ago   Up 20 minutes   9200/tcp, 9300/tcp, 9600/tcp, 9650/tcp                                                                                                            opensearch-node2
+bbb94e0fa43f   opensearchproject/opensearch:1.2.3               "./opensearch-docker…"   5 weeks ago   Up 20 minutes   0.0.0.0:9200->9200/tcp, [::]:9200->9200/tcp, 0.0.0.0:9300->9300/tcp, [::]:9300->9300/tcp, 0.0.0.0:9600->9600/tcp, [::]:9600->9600/tcp, 9650/tcp   opensearch-node1
+root@prod-oes-elk01-clone:~#
