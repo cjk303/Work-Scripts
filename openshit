@@ -1,20 +1,31 @@
-root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
-SRC=https://SOURCE_IP:9200          # the prod box's IP
-c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
+SRC=https://SOURCE_IP:9200     # prod IP
+OS=https://localhost:9200      # the CLONE's own OpenSearch
 
-# 1. one-doc test — this prints the real error if the prereqs are missing
-c -XPOST '_reindex' -d "{
-  \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
-    \"index\":\"gladsaxe-2026.10\",\"size\":1,\"max_docs\":1},
-  \"dest\":{\"index\":\"zz-test\"}}"
-{"error":"Incorrect HTTP method for uri [/-XPOST] and method [POST], allowed: [DELETE, HEAD, PUT, GET]","status":405}root@prod-oes-elk01:~#
-root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
-SRC=https://SOURCE_IP:9200          # the prod box's IP
-c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
+curl -sk -u admin:ksdjhfskjdhl -H 'Content-Type: application/json' \
+  -XPOST "$OS/_reindex" -d "{
+    \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
+      \"index\":\"gladsaxe-2026.10\",\"size\":1,\"max_docs\":1},
+    \"dest\":{\"index\":\"zz-test\"}}"
 
-# 1. one-doc test — this prints the real error if the prereqs are missing
-c -XPOST '_reindex' -d "{
-  \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
-    \"index\":\"gladsaxe-2026.10\",\"size\":1,\"max_docs\":1},
-  \"dest\":{\"index\":\"zz-test\"}}"
-{"error":"Incorrect HTTP method for uri [/-XPOST] and method [POST], allowed: [DELETE, HEAD, PUT, GET]","status":405}root@prod-oes-elk01:~#
+Expected good result: {"took":...,"created":1,...}. Then clear the probe:
+
+bash
+curl -sk -u admin:ksdjhfskjdhl -XDELETE "$OS/zz-test"
+
+If it comes back created:1, refill the three emptied indices (still on the clone):
+
+bash
+for i in gladsaxe-2026.08 gladsaxe-2026.09 gladsaxe-2026.10; do
+  echo "=== $i ==="
+  curl -sk -u admin:ksdjhfskjdhl -H 'Content-Type: application/json' \
+    -XPOST "$OS/_reindex?wait_for_completion=false&slices=auto" -d "{
+      \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\",
+        \"socket_timeout\":\"5m\"},\"index\":\"$i\",\"size\":2000},
+      \"dest\":{\"index\":\"$i\"}}"
+  echo
+done
+
+# watch progress
+curl -sk -u admin:ksdjhfskjdhl "$OS/_tasks?actions=*reindex&detailed" | python3 -m json.tool
+
+Quick sanity check before you run anything: hostname — make sure it is not prod-oes-elk01. If the clone and prod have the same hostname (a VM-clone side effect), that's its own problem worth fixing, and it would explain the confusion about which box you're on. What does hostname say on
