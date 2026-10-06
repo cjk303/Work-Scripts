@@ -1,26 +1,18 @@
-Source port [9200]:
-Source read user [admin]:
-Source password:
-Local admin password:
-Index pattern [*]:
-Timestamp field [@timestamp]:
-Import last how many days [7]: 5
-Throttle req/s (-1 = unlimited) [2000]:
-Scroll batch size [2000]:
+docker inspect opensearch-node1 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}' | grep -i 'config\|\.yml'
 
------ CONNECTIVITY -----
-source https://10.50.119.4:9200 -> HTTP 200   local -> HTTP 200
+docker inspect opensearch-node2 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
 
------ PREFLIGHT (copy 1 doc to prove the link works) -----
-Preflight blocked by a remote-reindex prerequisite:
-{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"}],"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"},"status":400}
+docker inspect opensearch-node2 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
 
-could not locate opensearch.yml on disk for opensearch-node2.
-Prereq not resolved. Fix opensearch.yml + restart, then re-run.
-root@prod-oes-elk01-clone:~# docker ps -a
-CONTAINER ID   IMAGE                                            COMMAND                  CREATED       STATUS          PORTS                                                                                                                                             NAMES
-44390d5dc3d7   docker.elastic.co/logstash/logstash-oss:7.12.1   "/usr/local/bin/dock…"   5 weeks ago   Up 20 minutes   0.0.0.0:5011-5013->5011-5013/tcp, [::]:5011-5013->5011-5013/tcp, 0.0.0.0:5044->5044/tcp, [::]:5044->5044/tcp, 9600/tcp                            logstash
-9f9420e787bb   opensearchproject/opensearch-dashboards:1.2.0    "./opensearch-dashbo…"   5 weeks ago   Up 20 minutes   0.0.0.0:5601->5601/tcp, [::]:5601->5601/tcp                                                                                                       opensearch-dashboards
-3720a53f3849   opensearchproject/opensearch:1.2.3               "./opensearch-docker…"   5 weeks ago   Up 20 minutes   9200/tcp, 9300/tcp, 9600/tcp, 9650/tcp                                                                                                            opensearch-node2
-bbb94e0fa43f   opensearchproject/opensearch:1.2.3               "./opensearch-docker…"   5 weeks ago   Up 20 minutes   0.0.0.0:9200->9200/tcp, [::]:9200->9200/tcp, 0.0.0.0:9300->9300/tcp, [::]:9300->9300/tcp, 0.0.0.0:9600->9600/tcp, [::]:9600->9600/tcp, 9650/tcp   opensearch-node1
-root@prod-oes-elk01-clone:~#
+
+cd /home/xxujd/elasticsearch_opendistro
+tail -5 opensearch.yml          # make sure the last line isn't indented
+cp -n opensearch.yml opensearch.yml.bak
+cat >> opensearch.yml <<'EOF'
+
+reindex.remote.whitelist: "10.50.119.4:9200"
+reindex.ssl.verification_mode: none
+EOF
+docker restart opensearch-node1 opensearch-node2
+sleep 20
+curl -sk -u admin:ksdjhfskjdhl https://localhost:9200/_cluster/health?pretty
