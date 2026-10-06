@@ -1,39 +1,146 @@
-root@prod-oes-elk01:/home/rundeck# cd /home/xxujd/elasticsearch_opendistro
-root@prod-oes-elk01:/home/xxujd/elasticsearch_opendistro# grep -niE 'user|pass' docker-compose.yml custom-opensearch_dashboards.yml logstash.conf readme.md run.sh
-docker-compose.yml:18:        soft: 65536 # maximum number of open files for the OpenSearch user, set to at least 65536 on modern systems
-docker-compose.yml:23:      - ./internal_users.yml:/usr/share/opensearch/plugins/opensearch-security/securityconfig/internal_users.yml
-docker-compose.yml:59:      - ./internal_users.yml:/usr/share/opensearch/plugins/opensearch-security/securityconfig/internal_users.yml
-custom-opensearch_dashboards.yml:20:opensearch.username: "kibanaserver"
-custom-opensearch_dashboards.yml:21:opensearch.password: 'gfG%^fgsdf'
-logstash.conf:83:      user => admin
-logstash.conf:84:      password => ksdjhfskjdhl
-logstash.conf:93:      user => admin
-logstash.conf:94:      password => ksdjhfskjdhl
-logstash.conf:103:      user => admin
-logstash.conf:104:      password => ksdjhfskjdhl
-logstash.conf:113:      user => admin
-logstash.conf:114:      password => ksdjhfskjdhl
-logstash.conf:123:      user => admin
-logstash.conf:124:      password => ksdjhfskjdhl
-logstash.conf:133:      user => admin
-logstash.conf:134:      password => ksdjhfskjdhl
-logstash.conf:143:      user => admin
-logstash.conf:144:      password => ksdjhfskjdhl
-logstash.conf:153:      user => admin
-logstash.conf:154:      password => ksdjhfskjdhl
-logstash.conf:163:      user => admin
-logstash.conf:164:      password => ksdjhfskjdhl
-logstash.conf:173:      user => admin
-logstash.conf:174:      password => ksdjhfskjdhl
-logstash.conf:183:      user => admin
-logstash.conf:184:      password => ksdjhfskjdhl
-logstash.conf:193:      user => admin
-logstash.conf:194:      password => ksdjhfskjdhl
-logstash.conf:203:      user => admin
-logstash.conf:204:      password => ksdjhfskjdhl
-logstash.conf:213:      user => admin
-logstash.conf:214:      password => ksdjhfskjdhl
-logstash.conf:223:      user => admin
-logstash.conf:224:      password => ksdjhfskjdhl
-readme.md:3:Please change password to logstash and kibana...
-root@prod-oes-elk01:/home/xxujd/elasticsearch_opendistro#
+#!/usr/bin/env bash
+#
+# opensearch-audit.sh — read-only survey of a single-host OpenSearch 1.2.x stack
+# to decide whether it holds anything worth keeping.
+#
+# Runs ONLY GETs and size:0 searches. It never writes, updates, or deletes.
+#
+# Run on the host (prod-oes-elk01) as a user that can reach docker + localhost:9200:
+#     chmod 600 opensearch-audit.sh
+#     ./opensearch-audit.sh | tee oes-audit-$(date +%F).txt
+#
+# The admin password is base64 in PW_B64 below. Base64 is OBFUSCATION, NOT
+# encryption — anyone with this file can decode it. Keep it chmod 600 and do not
+# commit it. To re-encode after a password change:
+#     printf '%s' 'NEWPASS' | base64
+#
+set -uo pipefail
+
+# ---- config ----------------------------------------------------------------
+OS="https://localhost:9200"
+PW_B64="a3Nkamhmc2tqZGhs"                     # admin password, base64
+PW="$(printf '%s' "$PW_B64" | base64 -d)"
+AUTH="admin:${PW}"
+
+OS_NODE="opensearch-node1"                     # container publishing 9200
+LS_NODE="logstash"                             # logstash container
+LS_CONF="/home/xxujd/elasticsearch_opendistro/logstash.conf"
+LISTEN_PORTS="5011|5012|5013|5044"             # logstash input ports
+TS_FIELD="@timestamp"                          # timestamp field used by data
+
+# ---- helpers ---------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+hr()   { printf '\n============ %s ============\n' "$1"; }
+
+q() {   # q <path> [extra curl args...]
+  curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$1" "${@:2}"
+}
+
+pp() {  # pretty-print JSON from stdin
+  if   have jq;      then jq .
+  elif have python3; then python3 -m json.tool
+  else cat; fi
+}
+
+parse_ranges() {   # turn the date-range agg into a readable table
+  have python3 || { cat; return; }
+  python3 -c '
+import sys,json
+try: d=json.load(sys.stdin)
+except Exception: print("  (could not parse response)"); sys.exit(0)
+bs=d.get("aggregations",{}).get("idx",{}).get("buckets",[])
+if not bs:
+    print("  (no buckets — indices may lack the timestamp field)"); sys.exit(0)
+print("  %-45s %12s  %-25s %-25s" % ("index","docs","oldest","newest"))
+for b in bs:
+    o=b.get("oldest",{}).get("value_as_string","-")
+    n=b.get("newest",{}).get("value_as_string","-")
+    print("  %-45s %12d  %-25s %-25s" % (b["key"],b["doc_count"],o,n))
+'
+}
+
+# ---- 0. connectivity -------------------------------------------------------
+hr "CONNECTIVITY"
+code="$(q '' -o /dev/null -w '%{http_code}')"
+echo "GET $OS/ -> HTTP ${code:-no-response}"
+if [ "${code:-}" != "200" ]; then
+  echo "WARNING: not HTTP 200. Bad password (check PW_B64) or node1 down."
+  echo "         Cluster queries below will fail; docker-based checks still run."
+fi
+
+# ---- 1. what is stored -----------------------------------------------------
+hr "CLUSTER HEALTH"
+q '_cluster/health?pretty'
+
+hr "DISK ALLOCATION"
+q '_cat/allocation?v'
+
+hr "INDICES BY SIZE (largest first)"
+q '_cat/indices?v&s=store.size:desc&h=health,index,docs.count,docs.deleted,store.size,creation.date.string'
+
+hr "DATA DATE RANGE PER INDEX (field: ${TS_FIELD})"
+q "*,-.*/_search?size=0" -d "{
+  \"aggs\":{\"idx\":{\"terms\":{\"field\":\"_index\",\"size\":1000},
+    \"aggs\":{\"oldest\":{\"min\":{\"field\":\"${TS_FIELD}\"}},
+             \"newest\":{\"max\":{\"field\":\"${TS_FIELD}\"}}}}}}" | parse_ranges
+
+hr "RETENTION (ISM policies)"
+ism="$(q '_plugins/_ism/explain/*?pretty' 2>/dev/null)"
+echo "$ism" | grep -E '"index"|policy_id|"state"' | head -60
+echo "$ism" | grep -q 'policy_id' || echo "  -> no policy_id found = no retention = indices grow forever"
+
+# ---- 2. is anything still feeding it ---------------------------------------
+hr "LOGSTASH THROUGHPUT (two samples, 30s apart)"
+if have docker && docker ps --format '{{.Names}}' | grep -qx "$LS_NODE"; then
+  ls_out() {
+    docker exec "$LS_NODE" curl -s localhost:9600/_node/stats/events 2>/dev/null \
+      | { have python3 && python3 -c 'import sys,json;print(json.load(sys.stdin)["events"]["out"])' 2>/dev/null || cat; }
+  }
+  o1="$(ls_out)"; echo "events.out t0 : ${o1:-?}"
+  sleep 30
+  o2="$(ls_out)"; echo "events.out t30: ${o2:-?}"
+  if [[ "${o1:-}" =~ ^[0-9]+$ && "${o2:-}" =~ ^[0-9]+$ ]]; then
+    [ "$o2" -gt "$o1" ] && echo "  -> RISING: data is actively flowing" \
+                        || echo "  -> flat: no events processed in this window"
+  fi
+else
+  echo "logstash container '$LS_NODE' not running / docker unavailable"
+fi
+
+hr "LOGSTASH INPUTS / INDEX TARGETS"
+if [ -f "$LS_CONF" ]; then
+  grep -nE 'input|beats|tcp|udp|http|kafka|port|index *=>' "$LS_CONF"
+else
+  echo "logstash.conf not found at $LS_CONF"
+fi
+
+hr "ACTIVE SENDER CONNECTIONS (ports ${LISTEN_PORTS})"
+ss -tnp 2>/dev/null | grep -E ":(${LISTEN_PORTS})\b" || echo "  none established right now"
+
+# ---- 3. is anyone reading it -----------------------------------------------
+hr "HUMAN LOGINS (audit log, last 90d, excluding service accounts)"
+q 'security-auditlog-*/_search?size=0' -d '{
+  "query":{"bool":{
+    "filter":[{"range":{"@timestamp":{"gte":"now-90d"}}}],
+    "must_not":[{"terms":{"audit_request_effective_user":["kibanaserver","admin","logstash"]}}]}},
+  "aggs":{"users":{"terms":{"field":"audit_request_effective_user","size":50},
+    "aggs":{"last":{"max":{"field":"@timestamp"}}}}}}' | pp
+echo "Empty 'users' buckets = no non-service users in 90d."
+echo "Re-run without the must_not block to see admin source IPs (audit_request_remote_address)."
+
+hr "SAVED DASHBOARDS / VISUALIZATIONS"
+q '.kibana*/_search?size=0' -d '{"aggs":{"type":{"terms":{"field":"type","size":30}}}}' | pp
+
+# ---- verdict guide ---------------------------------------------------------
+hr "HOW TO READ THIS"
+cat <<'EOF'
+Probably expendable:
+  - small indices, newest timestamp is months old
+  - Logstash events.out flat, no established connections on input ports
+  - no human users in the audit log, no saved dashboards
+
+Keep it (live pipeline, even if neglected):
+  - fresh newest timestamps
+  - events.out rising and/or active senders on 5044 / 501x
+  - named people in the audit log, or dashboards/visualizations present
+EOF
