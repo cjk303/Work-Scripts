@@ -1,4 +1,4 @@
-root@prod-oes-elk01:~# SRC=https://SOURCE_IP:9200; OS=https://localhost:9200
+root@prod-oes-elk01-clone:/home/rundeck# SRC=https://10.50.119.4:9200; OS=https://localhost:9200
 curl -sk -u admin:ksdjhfskjdhl -H 'Content-Type: application/json' \
   -XPOST "$OS/_reindex" -d "{
     \"max_docs\":1,
@@ -6,4 +6,4 @@ curl -sk -u admin:ksdjhfskjdhl -H 'Content-Type: application/json' \
       \"index\":\"gladsaxe-2026.10\",\"size\":1},
     \"dest\":{\"index\":\"zz-test\"}}"
 curl -sk -u admin:ksdjhfskjdhl -XDELETE "$OS/zz-test"
-{"error":{"root_cause":[{"type":"x_content_parse_exception","reason":"[4:42] [reindex] failed to parse field [source]"}],"type":"x_content_parse_exception","reason":"[4:42] [reindex] failed to parse field [source]","caused_by":{"type":"illegal_argument_exception","reason":"[host] must be of the form [scheme]://[host]:[port](/[pathPrefix])? but was [https://SOURCE_IP:9200]","caused_by":{"type":"u_r_i_syntax_exception","reason":"The port was not defined in the [host]: https://SOURCE_IP:9200"}}},"status":400}{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [zz-test]","index":"zz-test","resource.id":"zz-test","resource.type":"index_or_alias","index_uuid":"_na_"}],"type":"index_not_found_exception","reason":"no such index [zz-test]","index":"zz-test","resource.id":"zz-test","resource.type":"index_or_alias","index_uuid":"_na_"},"status":404}root@prod-oes-elk01:~#
+{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"}],"type":"illegal_argument_exception","reason":"[10.50.119.4:9200] not whitelisted in reindex.remote.whitelist"},"status":400}{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [zz-test]","index":"zz-test","resource.id":"zz-test","resource.type":"index_or_alias","index_uuid":"_na_"}],"type":"index_not_found_exception","reason":"no such index [zz-test]","index":"zz-test","resource.id":"zz-test","resource.type":"index_or_alias","index_uuid":"_na_"},"status":404}root@prod-oes-elk01-clone:/home/rundeck#
