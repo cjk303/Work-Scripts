@@ -1,35 +1,48 @@
-Locating custom certificate configuration and credential details.
-Locating custom certificate configuration and credential details.
-It's using custom certificates rather than the demo ones, so kirk.pem doesn't exist. Find out which certs are configured and which DN counts as admin:
-
-bash
-ls -l /usr/share/opensearch/config/
-grep -E 'pem|admin_dn|nodes_dn' -A3 /usr/share/opensearch/config/opensearch.yml
-On the host, also check what's mounted in, since the certs and config are probably bind-mounted from the compose directory:
-
-bash
-docker inspect opensearch-node1 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
-What you're looking for in opensearch.yml:
-
-yaml
-plugins.security.ssl.transport.pemtrustedcas_filepath: root-ca.pem   # -> -cacert
+[opensearch@bbb94e0fa43f tools]$ ls -l /usr/share/opensearch/config/
+total 44
+-rw-r--r-- 1       1007       1007 1705 Jun 11  2024 esnode-key.pem
+-rw-rw-rw- 1       1007       1007 1721 Jun 11  2024 esnode.pem
+-rw-r--rw- 1       1007       1007  107 Oct  4  2024 java.security
+-rw-rw---- 1 opensearch opensearch 2503 Dec 22  2021 jvm.options
+drwxr-x--- 2 opensearch opensearch 4096 Dec 21  2021 jvm.options.d
+-rw-rw---- 1 opensearch opensearch  285 Dec 22  2021 log4j2.properties
+drwxr-x--- 2 opensearch opensearch 4096 Dec 21  2021 opensearch-observability
+drwxr-x--- 2 opensearch opensearch 4096 Dec 21  2021 opensearch-reports-scheduler
+-rw-rw---- 1 opensearch opensearch  196 Aug 31 08:25 opensearch.keystore
+-rw-rw-rw- 1       1007       1007 2512 Aug 31 07:47 opensearch.yml
+-rw-r--r-- 1       1007       1007 1445 Jun 11  2024 root-ca.pem
+[opensearch@bbb94e0fa43f tools]$ grep -E 'pem|admin_dn|nodes_dn' -A3 /usr/share/opensearch/config/opensearch.yml
+plugins.security.ssl.transport.pemcert_filepath: esnode.pem
+plugins.security.ssl.transport.pemkey_filepath: esnode-key.pem
+plugins.security.ssl.transport.pemtrustedcas_filepath: root-ca.pem
+plugins.security.ssl.transport.enforce_hostname_verification: false
+plugins.security.ssl.http.enabled: true
+plugins.security.ssl.http.pemcert_filepath: esnode.pem
+plugins.security.ssl.http.pemkey_filepath: esnode-key.pem
+plugins.security.ssl.http.pemtrustedcas_filepath: root-ca.pem
+plugins.security.allow_unsafe_democertificates: true
+plugins.security.allow_default_init_securityindex: true
 plugins.security.authcz.admin_dn:
-  - "CN=admin,OU=...,O=...,C=..."                                    # admin cert subject
-Then find the cert/key pair whose subject matches admin_dn. It's often named admin.pem and admin-key.pem. Check each candidate with:
+  - CN=kirk,OU=client,O=client,L=test, C=de
 
-bash
-openssl x509 -in <file>.pem -noout -subject
-Once you have it, rerun with the right files:
+plugins.security.audit.type: internal_opensearch
+[opensearch@bbb94e0fa43f tools]$ docker inspect opensearch-node1 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+bash: docker: command not found
+[opensearch@bbb94e0fa43f tools]$ exit
+exit
+root@prod-oes-elk01:/home/rundeck# docker inspect opensearch-node1 --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}'
+/home/xxujd/elasticsearch_opendistro/action_groups.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/action_groups.yml
+/home/xxujd/elasticsearch_opendistro/config.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/config.yml
+/home/xxujd/elasticsearch_opendistro/internal_users.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/internal_users.yml
+/home/xxujd/elasticsearch_opendistro/roles.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/roles.yml
+/home/xxujd/elasticsearch_opendistro/roles_mapping.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/roles_mapping.yml
+/home/xxujd/elasticsearch_opendistro/tenants.yml -> /usr/share/opensearch/plugins/opensearch-security/securityconfig/tenants.yml
+/home/xxujd/elasticsearch_opendistro/esnode-key.pem -> /usr/share/opensearch/config/esnode-key.pem
+/home/xxujd/elasticsearch_opendistro/esnode.pem -> /usr/share/opensearch/config/esnode.pem
+/home/xxujd/elasticsearch_opendistro/root-ca.pem -> /usr/share/opensearch/config/root-ca.pem
+/var/lib/docker/volumes/elasticsearch_opendistro_d1/_data -> /usr/share/opensearch/data
+/home/xxujd/elasticsearch_opendistro/java.security -> /usr/share/opensearch/config/java.security
+/home/xxujd/elasticsearch_opendistro/opensearch.yml -> /usr/share/opensearch/config/opensearch.yml
 
-bash
-./securityadmin.sh -backup /tmp/secbackup -icl -nhnv \
-  -cacert $CFG/<root-ca>.pem -cert $CFG/<admin>.pem -key $CFG/<admin-key>.pem
-The key must be PKCS#8. If it complains about the key format, convert it:
-
-bash
-openssl pkcs8 -topk8 -nocrypt -in admin-key.pem -out /tmp/admin-key-pkcs8.pem
-If there's no admin cert anywhere (container or host), you have two fallbacks:
-
-Sign a new admin cert. If you can find the CA's private key on the host, sign a new client cert with a DN that's already in admin_dn.
-Use the node cert as admin. Temporarily add the node certificate's subject DN to plugins.security.authcz.admin_dn in opensearch.yml on both nodes. Then restart the nodes, run securityadmin.sh using the node cert/key, and remove the DN again afterwards.
-The hash you generated is for the literal string YourNewStrongPassword. Rerun hash.sh with the password you actually want before editing internal_users.yml.
+root@prod-oes-elk01:/home/rundeck# ls -l /usr/share/opensearch/config/
+ls: cannot access '/usr/share/opensearch/config/': No such file or directory
