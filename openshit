@@ -1,44 +1,27 @@
-root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
+So switch over to the clone and the recovery is just the two steps that matter: prove data flows with one doc, then refill. On the clone:
+
+bash
+AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
+SRC=https://SOURCE_IP:9200          # the prod box's IP
 c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
 
-c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
-# cancel whatever's listed:
-for t in $(c '_tasks?actions=*reindex' | python3 -c 'import sys,json
-for n in json.load(sys.stdin).get("nodes",{}).values():
-    [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
-  c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
-done
-{
-    "nodes": {}
-}
-root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
-c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
+# 1. one-doc test — this prints the real error if the prereqs are missing
+c -XPOST '_reindex' -d "{
+  \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\"},
+    \"index\":\"gladsaxe-2026.10\",\"size\":1,\"max_docs\":1},
+  \"dest\":{\"index\":\"zz-test\"}}"
 
-c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
-# cancel whatever's listed:
-for t in $(c '_tasks?actions=*reindex' | python3 -c 'import sys,json
-for n in json.load(sys.stdin).get("nodes",{}).values():
-    [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
-  c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
-done
-{
-    "nodes": {}
-}
-root@prod-oes-elk01:~# AUTH='admin:ksdjhfskjdhl'; OS=https://localhost:9200
-c(){ curl -sk -u "$AUTH" -H 'Content-Type: application/json' "$OS/$@"; }
+If that returns "created":1, the link works — delete the probe (c -XDELETE zz-test -o /dev/null) and run the refill:
 
-c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
-# cancel whatever's listed:
-for t in $(c '_tasks?actions=*reindex' | python3 -c 'import sys,json
-for n in json.load(sys.stdin).get("nodes",{}).values():
-    [print(k) for k in n.get("tasks",{})]' 2>/dev/null); do
-  c -XPOST "_tasks/$t/_cancel" -o /dev/null; echo "cancelled $t"
+bash
+# 2. refill the three emptied indices (no drop, reindex auto-creates mappings)
+for i in gladsaxe-2026.08 gladsaxe-2026.09 gladsaxe-2026.10; do
+  echo "=== $i ==="
+  c -XPOST "_reindex?wait_for_completion=false&slices=auto" -d "{
+    \"source\":{\"remote\":{\"host\":\"$SRC\",\"username\":\"admin\",\"password\":\"ksdjhfskjdhl\",
+      \"socket_timeout\":\"5m\"},\"index\":\"$i\",\"size\":2000},
+    \"dest\":{\"index\":\"$i\"}}"
+  echo
 done
-{
-    "nodes": {}
-}
-root@prod-oes-elk01:~# c '_tasks?actions=*reindex&detailed' | python3 -m json.tool
-{
-    "nodes": {}
-}
-root@prod-oes-elk01:~#
+
+c '_tasks?actions=*reindex&detailed' | python3 -m json.tool   # watch progress
